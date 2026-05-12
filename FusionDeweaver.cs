@@ -148,6 +148,7 @@ class DeweaverEngine
     private int _migratedAttributes;
     private int _unwrappedProxyAttributes;
     private int _recoveredCtorAssignments;
+    private MethodDefinition? _currentMethod;
     private int _retainILPropertiesPreserved;
     private int _restoredCollectionInits;
     private int _removedNetworkAssemblyIgnore;
@@ -817,9 +818,6 @@ class DeweaverEngine
 
         try { RemoveMethodImplFromProperties(type); }
         catch (Exception ex) { Console.WriteLine($"    WARNING: RemoveMethodImplFromProperties failed: {ex.Message}"); }
-
-        try { RemoveReadWriteHelperMethods(type); }
-        catch (Exception ex) { Console.WriteLine($"    WARNING: RemoveReadWriteHelperMethods failed: {ex.Message}"); }
     }
 
     /// <summary>
@@ -847,9 +845,10 @@ class DeweaverEngine
         foreach (var prop in networkedProps)
         {
             // De-obfuscate backing field name: strip C# special characters from <PropName>k__BackingField
-            // Convert to _propName if not taken, otherwise use standard k__BackingField with [CompilerGenerated]
+            // Convert to _propName (camelCase) if not taken, otherwise use standard k__BackingField with [CompilerGenerated]
             var obfuscatedName = $"<{prop.Name}>k__BackingField";
-            var normalizedName = $"_{prop.Name}";
+            var camelName = char.ToLowerInvariant(prop.Name[0]) + prop.Name.Substring(1);
+            var normalizedName = $"_{camelName}";
             
             // Check if normalized name is already taken
             string backingName;
@@ -1022,9 +1021,16 @@ class DeweaverEngine
                     Console.WriteLine($"    Cleaned NetworkString/string property: {prop.Name} ({prop.PropertyType.Name})");
                 }
 
-                // Find the backing field
+                        // Find the backing field
+                // Per weaver source, the original backing field is named <PropName>k__BackingField.
+                // However, CreateBackingFieldsForNetworkedProperties may have created it as _propName
+                // if the original was removed. We must check BOTH naming conventions.
                 var backingName = $"<{prop.Name}>k__BackingField";
-                var backingField = type.Fields.FirstOrDefault(f => f.Name == backingName);
+                var camelName = char.ToLowerInvariant(prop.Name[0]) + prop.Name.Substring(1);
+                var altBackingName = $"_{camelName}";
+
+                var backingField = type.Fields.FirstOrDefault(f => f.Name == backingName)
+                                 ?? type.Fields.FirstOrDefault(f => f.Name == altBackingName);
 
                 // Check if this property has RetainIL=true - if so, preserve the original body
                 bool isRetainIL = savedMeta?.RetainIL == true;
@@ -1341,6 +1347,10 @@ class DeweaverEngine
     /// that was referenced via [Networked(Default = "_myField")]. Such fields must be preserved.
     /// The property should still be restored to point to its new auto-backing field,
     /// but the data-source field must stay.
+    ///
+    /// Per Fusion.CodeGen.cs line 2058, default fields are named _{PropertyName}.
+    /// Per Fusion.CodeGen.cs line 2501, they get [DefaultForProperty(PropertyName, wordOffset, wordCount)].
+    /// The weaver also adds [WeaverGenerated] only when the field was auto-created (no user default).
     /// </summary>
     private void RemoveDefaultFields(TypeDefinition type)
     {
@@ -1357,15 +1367,34 @@ class DeweaverEngine
             var defaultField = type.Fields.FirstOrDefault(f => f.Name == defaultFieldName);
             if (defaultField == null) continue;
 
-            // Check if this field is weaver-generated or user-defined
-            bool isWeaverGenerated = SafeHasAttribute(defaultField, "WeaverGeneratedAttribute");
+            // SAFETY: Never remove a field that was just created by our own CreateBackingFieldsForNetworkedProperties.
+            // The deweaver creates backing fields named _camelCase or <PropName>k__BackingField.
+            // The weaver's default field is ALSO named _PropName. We must distinguish them:
+            // - Weaver default field: has [DefaultForPropertyAttribute] (per CodeGen line 2501)
+            // - Deweaver-created backing field: has [CompilerGenerated] + [DebuggerBrowsable(Never)]
+            bool isDeweaverBackingField = SafeHasAttribute(defaultField, "CompilerGeneratedAttribute");
+            if (isDeweaverBackingField)
+            {
+                // This is OUR backing field, not the weaver's default field. Skip it.
+                continue;
+            }
 
-            if (isWeaverGenerated)
+            // Check if this field is weaver-generated or user-defined
+            // Per CodeGen source, weaver-created fields get [DefaultForProperty].
+            // WeaverGeneratedAttribute may not always be present (depends on Fusion version),
+            // so we also check for [DefaultForPropertyAttribute] as the primary indicator.
+            bool hasDefaultForProperty = SafeHasAttribute(defaultField, "DefaultForPropertyAttribute");
+            bool isWeaverGenerated = SafeHasAttribute(defaultField, "WeaverGeneratedAttribute");
+            bool shouldRemove = isWeaverGenerated || hasDefaultForProperty;
+
+            if (shouldRemove)
             {
                 // Weaver-generated field: safe to remove
+                // But first fix any stale references in method bodies (ctors may use this field)
+                FixStaleFieldReferencesInMethodBodies(type, defaultField);
                 type.Fields.Remove(defaultField);
                 _removedDefaultFields++;
-                Console.WriteLine($"    Removed weaver-generated default field: {defaultFieldName}");
+                Console.WriteLine($"    Removed weaver default field: {defaultFieldName}");
             }
             else
             {
@@ -1416,11 +1445,13 @@ class DeweaverEngine
                                               p.ParameterType.FullName.Contains("SimulationDataPtr")))
             .ToList();
 
-        // Fallback: also remove if they have WeaverGeneratedAttribute
+        // Fallback: also remove if they have WeaverGeneratedAttribute OR DefaultForPropertyAttribute
+        // (DefaultForPropertyAttribute is added by the weaver per CodeGen line 2501)
         var weaverGeneratedMethods = type.Methods
             .Where(m => (m.Name == "CopyBackingFieldsToState" || m.Name == "CopyStateToBackingFields" ||
                          m.Name == "CopyAllBackingFieldsToState" || m.Name == "CopyAllStateToBackingFields") &&
-                        m.CustomAttributes.Any(a => a.AttributeType.Name == "WeaverGeneratedAttribute"))
+                        (m.CustomAttributes.Any(a => a.AttributeType.Name == "WeaverGeneratedAttribute") ||
+                         m.CustomAttributes.Any(a => a.AttributeType.Name == "DefaultForPropertyAttribute")))
             .ToList();
 
         var allToRemove = methods.Union(weaverGeneratedMethods).ToList();
@@ -1800,8 +1831,12 @@ class DeweaverEngine
             foreach (var prop in networkedProps)
             {
                 var defaultFieldName = $"_{prop.Name}";
+                // Look for backing field using BOTH naming conventions (same as RestoreNetworkedProperties)
                 var backingName = $"<{prop.Name}>k__BackingField";
-                var backingField = type.Fields.FirstOrDefault(f => f.Name == backingName);
+                var camelName = char.ToLowerInvariant(prop.Name[0]) + prop.Name.Substring(1);
+                var altBackingName = $"_{camelName}";
+                var backingField = type.Fields.FirstOrDefault(f => f.Name == backingName)
+                                     ?? type.Fields.FirstOrDefault(f => f.Name == altBackingName);
                 if (backingField == null) continue;
 
                 var backingRef = _module.ImportReference(backingField);
@@ -2407,46 +2442,56 @@ class DeweaverEngine
 
                 // Create redirected instructions using two-pass clone+remap approach.
                 // Pass 1: Clone all instructions, building a map from old→new.
-                // Pass 2: Remap branch targets so they point to the new clones.
-                // This is critical for complex inline initializations that produce
-                // branch instructions (e.g., `public int Score = someFlag ? 10 : 0;`)
                 var instructionMap = new Dictionary<Instruction, Instruction>();
                 var insertInstrs = new List<Instruction>();
 
-                foreach (var capturedInstr in capturedInits)
+                for (int i = 0; i < capturedInits.Count; i++)
                 {
-                    Instruction? newInstr;
+                    var capturedInstr = capturedInits[i];
+                    Instruction? newInstr = null;
 
-                    // Redirect field references from _PropName to <PropName>k__BackingField
-                    if (capturedInstr.Operand is FieldReference fr && fieldRedirectMap.TryGetValue(fr.Name, out var newFieldRef))
+                    // Semantic Check: ValueType to Class (e.g., string)
+                    // If the field has been reverted to a Class, transform Ldflda + Initobj logic into Ldnull + Stfld.
+                    if (capturedInstr.OpCode == OpCodes.Ldflda && capturedInstr.Operand is FieldReference fr && 
+                        fieldRedirectMap.TryGetValue(fr.Name, out var newFieldRef))
                     {
-                        newInstr = il.Create(capturedInstr.OpCode, newFieldRef);
+                        var fieldDef = newFieldRef.Resolve();
+                        bool isNowClass = fieldDef != null && !fieldDef.FieldType.IsValueType;
+                        
+                        if (isNowClass && i + 1 < capturedInits.Count && capturedInits[i + 1].OpCode == OpCodes.Initobj)
+                        {
+                            var ldnull = il.Create(OpCodes.Ldnull);
+                            var stfld = il.Create(OpCodes.Stfld, newFieldRef);
+                            
+                            insertInstrs.Add(ldnull);
+                            insertInstrs.Add(stfld);
+                            
+                            instructionMap[capturedInstr] = ldnull;
+                            instructionMap[capturedInits[i + 1]] = stfld;
+                            
+                            i++; // Skip Initobj
+                            continue;
+                        }
+                    }
+
+                    // Standard redirection or cloning
+                    if (capturedInstr.Operand is FieldReference fr2 && fieldRedirectMap.TryGetValue(fr2.Name, out var nfr))
+                    {
+                        newInstr = il.Create(capturedInstr.OpCode, nfr);
                     }
                     else
                     {
-                        // Can't directly reuse instructions from another method body, need to recreate
                         newInstr = CloneInstruction(il, capturedInstr);
                     }
 
                     if (newInstr != null)
                     {
-                        // Map the old instruction to the new clone for branch remapping.
-                        // Only map non-field-reference instructions (field-redirected ones
-                        // have a different source so they can't be branch targets from the
-                        // original method).
-                        if (!fieldRedirectMap.ContainsKey(capturedInstr.Operand is FieldReference f2 ? f2.Name : ""))
-                        {
-                            instructionMap[capturedInstr] = newInstr;
-                        }
+                        instructionMap[capturedInstr] = newInstr;
                         insertInstrs.Add(newInstr);
                     }
                 }
 
                 // Pass 2: Remap branch targets to point to the new cloned instructions.
-                // Branch instructions (Br, Brtrue, Brfalse, Beq, Bne, Bgt, Blt, Switch, etc.)
-                // have Operands that point to other Instruction objects. Since we cloned
-                // them, the old targets are invalid in the new method context. We must
-                // update each branch target to point to the corresponding new clone.
                 foreach (var clone in insertInstrs)
                 {
                     if (clone.Operand is Instruction oldTarget && instructionMap.TryGetValue(oldTarget, out var newTarget))
@@ -3013,6 +3058,14 @@ class DeweaverEngine
     /// Detection: Check if a Property has [WeaverGeneratedAttribute]. If so, and the corresponding
     /// _PropertyName field exists (which would be the renamed user field), restore the field to its
     /// original name and type.
+    ///
+    /// Per Fusion.CodeGen.cs line 1968, the weaver stores the user's original field as _{PropertyName}
+    /// with [FixedBufferPropertyAttribute] and [DefaultForPropertyAttribute]. The property type IS
+    /// the original type (the weaver creates a FixedStorage field, not changes the property type).
+    ///
+    /// CRITICAL: We must also check for the deweaver's own auto-created backing fields
+    /// (named <PropName>k__BackingField or _camelCase with [CompilerGenerated]). We must NOT
+    /// revert properties whose backing field was created by the deweaver itself.
     /// </summary>
     private void RevertWeaverGeneratedPropertiesToFields(TypeDefinition type)
     {
@@ -3026,6 +3079,17 @@ class DeweaverEngine
             var underlyingFieldName = $"_{prop.Name}";
             var underlyingField = type.Fields.FirstOrDefault(f => f.Name == underlyingFieldName);
             if (underlyingField == null) continue;
+
+            // Skip if this is a deweaver-created backing field (has [CompilerGenerated] but no
+            // FixedBufferPropertyAttribute). The deweaver adds [CompilerGenerated] to all backing
+            // fields it creates, but the weaver's struct storage fields have [FixedBufferProperty].
+            bool isDeweaverBackingField = SafeHasAttribute(underlyingField, "CompilerGeneratedAttribute") &&
+                                       !SafeHasAttribute(underlyingField, "FixedBufferPropertyAttribute");
+            if (isDeweaverBackingField)
+            {
+                Console.WriteLine($"    Skipping revert of {prop.Name}: backing field is deweaver-generated");
+                continue;
+            }
 
             // The underlying field was the user's original field, renamed by the weaver.
             // Restore it to its original name and proper type.
@@ -3053,6 +3117,10 @@ class DeweaverEngine
             underlyingField.IsSpecialName = false;
             underlyingField.CustomAttributes.RemoveWhere(a =>
                 a.AttributeType.Name == "CompilerGeneratedAttribute");
+
+            // Fix any stale references to the old field name in method bodies
+            // (ctors and other methods may reference _PropName, which is now renamed to PropName)
+            FixStaleFieldReferencesAfterRename(type, underlyingFieldName, originalName);
 
             // Remove the weaver-generated property's getter and setter methods
             if (prop.GetMethod != null)
@@ -4353,6 +4421,37 @@ class DeweaverEngine
     }
 
     /// <summary>
+    /// After renaming a field (e.g., _PropName → PropName during struct property reversion),
+    /// update all FieldReference operands in method bodies to point to the renamed field.
+    /// This prevents dangling references that would cause MissingMethodException at runtime.
+    /// </summary>
+    private void FixStaleFieldReferencesAfterRename(TypeDefinition type, string oldFieldName, string newFieldName)
+    {
+        var renamedField = type.Fields.FirstOrDefault(f => f.Name == newFieldName);
+        if (renamedField == null) return;
+
+        var freshRef = _module.ImportReference(renamedField);
+
+        foreach (var method in type.Methods.ToList())
+        {
+            if (method.Body == null) continue;
+            try
+            {
+                var il = method.Body.GetILProcessor();
+                foreach (var instr in method.Body.Instructions)
+                {
+                    if (instr.Operand is FieldReference fr && fr.Name == oldFieldName &&
+                        fr.DeclaringType != null && fr.DeclaringType.FullName == type.FullName)
+                    {
+                        instr.Operand = freshRef;
+                    }
+                }
+            }
+            catch { }
+        }
+    }
+
+    /// <summary>
     /// Check if a FieldReference operand refers to the same field as a FieldDefinition.
     /// Compares by name and declaring type.
     /// </summary>
@@ -4541,7 +4640,7 @@ class DeweaverEngine
         if (op == OpCodes.Ldsflda)
         {
             il.Replace(instr, il.Create(OpCodes.Ldnull));
-            _stackNeutralReplacements++;
+             _stackNeutralReplacements++;
             return;
         }
 
@@ -4746,17 +4845,27 @@ class DeweaverEngine
             {
                 try
                 {
-                    // First pass: clean up dead code patterns
-                    deadCodeCleaned += CleanupDeadCodePatterns(method);
+                    _currentMethod = method;
+
+                    // CRITICAL: Only apply IL transformations to methods that were
+                    // actually modified by the deweaver. Applying RevertBitCounterLogic
+                    // or CleanupDeadCodePatterns to unmodified methods (e.g., obfuscated
+                    // methods in emotitron.Compression.BitCounter) corrupts their IL
+                    // because the patterns falsely match non-woven code.
+                    bool isModified = WasMethodModifiedByDeweaver(method);
+
+                    if (isModified)
+                    {
+                        // First pass: clean up dead code patterns and revert pointer math
+                        // ONLY on methods the deweaver actually touched
+                        deadCodeCleaned += CleanupDeadCodePatterns(method);
+                        deadCodeCleaned += RevertBitCounterLogic(method);
+                    }
 
                     // Second pass: validate stack balance
                     if (!ValidateMethodBodyStackBalance(method))
                     {
-                        // Check if this method was modified by the deweaver
-                        // by looking for known patterns of deweaver modifications
-                        bool wasModifiedByDeweaver = WasMethodModifiedByDeweaver(method);
-
-                        if (wasModifiedByDeweaver)
+                        if (isModified)
                         {
                             // v8: NEVER stub deweaver-modified methods. Instead, attempt to fix.
                             // With correct ECMA-335 stack deltas, most "imbalances" are false positives
@@ -4789,7 +4898,7 @@ class DeweaverEngine
                         {
                             // Method we didn't touch — just warn, don't destroy it
                             // The original IL might use patterns our validator doesn't handle
-                            // (unsafe code, pointer arithmetic, etc.)
+                            // (unsafe code, pointer arithmetic, obfuscated IL, etc.)
                             Console.WriteLine($"  NOTE: Stack balance anomaly in {type.Name}::{method.Name} (not deweaver-modified, leaving as-is)");
                             warningsOnly++;
                         }
@@ -4822,6 +4931,48 @@ class DeweaverEngine
         if (_processedNetworkBehaviours.Contains(type.FullName))
             return true;
 
+        // v8: Only include emotitron.Compression/GorillaTag/Extensions if the type was
+        // actually processed by the deweaver (e.g., has weaved NetworkBehaviours or structs).
+        // Blanket-matching these namespaces was causing false positives that led to
+        // RevertBitCounterLogic and PatchStackUnderflows corrupting non-woven methods
+        // (e.g., emotitron.Compression.BitCounter.UsedBitCount uses ldarga/dup/ldind
+        // patterns that falsely match the deweaver's pointer-math reversion).
+        //
+        // Instead, only match these namespaces if the type was explicitly processed.
+        if (type.Namespace != null && (type.Namespace.Contains("emotitron.Compression") || 
+                                       type.Namespace.Contains("GorillaTag") ||
+                                       type.Name.Contains("Extensions")))
+        {
+            if (_processedNetworkBehaviours.Contains(type.FullName))
+                return true;
+
+            // Also check if this specific method references Fusion types (true sign of weaving)
+            foreach (var instr in method.Body.Instructions)
+            {
+                if (instr.Operand is TypeReference tr)
+                {
+                    if (tr.Namespace == "Fusion.CodeGen" ||
+                        tr.Name.Contains("FixedStorage") ||
+                        tr.Name.Contains("NetworkString`1"))
+                        return true;
+                }
+                if (instr.Operand is MethodReference mr && mr.DeclaringType != null)
+                {
+                    if (mr.DeclaringType.Namespace == "Fusion.CodeGen" ||
+                        mr.DeclaringType.Name?.Contains("FixedStorage") == true)
+                        return true;
+                }
+                if (instr.Operand is FieldReference fr && fr.FieldType != null)
+                {
+                    if (fr.FieldType.Namespace == "Fusion.CodeGen" ||
+                        fr.FieldType.Name?.Contains("NetworkString`1") == true)
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
         // Check if any instruction references Fusion.CodeGen or removed types
         foreach (var instr in method.Body.Instructions)
         {
@@ -4846,6 +4997,11 @@ class DeweaverEngine
                 if (fr.FieldType?.Name?.Contains("NetworkString`1") == true)
                     return true;
             }
+            
+            // NOTE: The "Dup followed by Ldind" fingerprint check was removed here because
+            // it caused false positives on non-woven methods (e.g., BitCounter.UsedBitCount
+            // in emotitron.Compression uses dup+ldind as part of its bit-spread algorithm).
+            // This pattern alone is not sufficient to identify Fusion-woven code.
         }
 
         return false;
@@ -5058,7 +5214,13 @@ class DeweaverEngine
 
             // Check for stack underflow
             if (currentDepth < pops)
+            {
+                if (method.FullName.Contains("UsedBitCount"))
+                {
+                    Console.WriteLine($"[DEBUG] Stack underflow in {method.FullName} at {instr} (depth {currentDepth}, pops {pops})");
+                }
                 return false; // Stack underflow!
+            }
 
             int newDepth = currentDepth - pops + pushes;
 
@@ -5191,42 +5353,35 @@ class DeweaverEngine
                 }
             }
 
-            // Fix CS0201: Look for "Stack Litter" - Ldarg_0 followed immediately by another Ldarg_0 or Ldloc
-            // without a consuming Stfld or Call. This is leftover from weaver removal.
+            // Fix CS0201/CS8183: Look for "Stack Litter"
+            // If an instruction pushes a value (Ldarg_0, Ldloc, or Ldarg) and is followed by another push 
+            // or a terminator (Ret, Br, Leave, Throw) without a consuming instruction (like Stfld, Stloc, or Call) 
+            // appearing in the next 5 instructions, the first push is "litter" and must be removed.
             for (int i = 0; i < instructions.Count - 1; i++)
             {
                 var instr1 = instructions[i];
                 var instr2 = instructions[i + 1];
 
-                // Pattern: Ldarg_0 (or Ldloc) followed by another Ldarg_0/Ldloc without consumption
-                bool isLdarg0 = instr1.OpCode == OpCodes.Ldarg_0;
-                bool isLdargOrLdloc = instr2.OpCode == OpCodes.Ldarg_0 || 
-                                      instr2.OpCode == OpCodes.Ldarg || 
-                                      instr2.OpCode == OpCodes.Ldloc || 
-                                      instr2.OpCode == OpCodes.Ldloc_S;
+                bool isPush1 = instr1.OpCode == OpCodes.Ldarg_0 || instr1.OpCode == OpCodes.Ldarg || 
+                               instr1.OpCode == OpCodes.Ldloc || instr1.OpCode == OpCodes.Ldloc_S;
+                
+                var (p2, u2) = GetInstructionStackDelta(instr2);
+                bool isPush2 = u2 > 0 && p2 == 0;
+                bool isTerminator2 = instr2.OpCode == OpCodes.Ret || IsBranch(instr2.OpCode) || 
+                                     instr2.OpCode == OpCodes.Throw || instr2.OpCode == OpCodes.Leave || 
+                                     instr2.OpCode == OpCodes.Leave_S;
 
-                if (isLdarg0 && isLdargOrLdloc)
+                if (isPush1 && (isPush2 || isTerminator2))
                 {
                     // Check if there's a consuming instruction after instr2
                     bool hasConsumer = false;
-                    for (int j = i + 2; j < Math.Min(i + 5, instructions.Count); j++)
+                    for (int j = i + 1; j < Math.Min(i + 6, instructions.Count); j++)
                     {
                         var nextInstr = instructions[j];
-                        if (nextInstr.OpCode == OpCodes.Stfld || 
-                            nextInstr.OpCode == OpCodes.Call || 
-                            nextInstr.OpCode == OpCodes.Callvirt ||
-                            nextInstr.OpCode == OpCodes.Newobj)
+                        var (popCount, pushCount) = GetInstructionStackDelta(nextInstr);
+                        if (popCount > 0)
                         {
                             hasConsumer = true;
-                            break;
-                        }
-                        // If we hit a branch or ret before a consumer, it's litter
-                        if (nextInstr.OpCode == OpCodes.Ret || 
-                            nextInstr.OpCode == OpCodes.Br || 
-                            nextInstr.OpCode == OpCodes.Br_S ||
-                            nextInstr.OpCode == OpCodes.Leave ||
-                            nextInstr.OpCode == OpCodes.Leave_S)
-                        {
                             break;
                         }
                     }
@@ -5247,6 +5402,155 @@ class DeweaverEngine
         }
         return cleaned;
     }
+
+    private static bool IsBranch(OpCode op)
+    {
+        return op.FlowControl == FlowControl.Branch || 
+               op.FlowControl == FlowControl.Cond_Branch;
+    }
+
+    /// <summary>
+    /// Reverts pointer-based BitCounter/Arithmetic logic to high-level operations.
+    /// Also simplifies all general [addr -> deref] pairs to direct loads.
+    /// 
+    /// IMPORTANT: This method must ONLY be called on methods that were actually modified
+    /// by the Fusion weaver. Applying it to non-woven methods (e.g., obfuscated code in
+    /// emotitron.Compression.BitCounter) corrupts their IL because the ldarga+dup+ldind
+    /// pattern falsely matches non-woven read-modify-write patterns.
+    /// </summary>
+    private int RevertBitCounterLogic(MethodDefinition method)
+    {
+        if (method.Body == null) return 0;
+        int revertedCount = 0;
+        var instructions = method.Body.Instructions;
+        var il = method.Body.GetILProcessor();
+
+        // Pass 1: Revert the full assignment pattern (addr, dup, ldind ... stind)
+        for (int i = 0; i <= instructions.Count - 5; i++)
+        {
+            try
+            {
+                var instr0 = instructions[i];
+                if (!(instr0.OpCode == OpCodes.Ldflda || 
+                      instr0.OpCode == OpCodes.Ldarga || instr0.OpCode == OpCodes.Ldarga_S ||
+                      instr0.OpCode == OpCodes.Ldloca || instr0.OpCode == OpCodes.Ldloca_S))
+                    continue;
+
+                if (instructions[i + 1].OpCode != OpCodes.Dup)
+                    continue;
+
+                var instrLd = instructions[i + 2];
+                if (!(instrLd.OpCode.Name.StartsWith("ldind") || instrLd.OpCode == OpCodes.Ldobj))
+                    continue;
+
+                int stIdx = -1;
+                for (int j = i + 3; j < Math.Min(i + 25, instructions.Count); j++)
+                {
+                    if (instructions[j].OpCode.Name.StartsWith("stind") || instructions[j].OpCode == OpCodes.Stobj)
+                    {
+                        stIdx = j;
+                        break;
+                    }
+                    if (instructions[j].OpCode == OpCodes.Ret || IsBranch(instructions[j].OpCode))
+                        break;
+                }
+
+                if (stIdx == -1) continue;
+                var instrSt = instructions[stIdx];
+
+                bool hasMath = false;
+                for (int m = i + 3; m < stIdx; m++)
+                {
+                    var op = instructions[m].OpCode;
+                    if (op == OpCodes.Or || op == OpCodes.And || op == OpCodes.Xor || 
+                        op == OpCodes.Add || op == OpCodes.Sub || op == OpCodes.Mul || 
+                        op == OpCodes.Div || op == OpCodes.Shr || op == OpCodes.Shl ||
+                        op == OpCodes.Add_Ovf || op == OpCodes.Sub_Ovf || op == OpCodes.Mul_Ovf ||
+                        op == OpCodes.Add_Ovf_Un || op == OpCodes.Sub_Ovf_Un || op == OpCodes.Mul_Ovf_Un ||
+                        op == OpCodes.Rem || op == OpCodes.Rem_Un || op == OpCodes.Shr_Un ||
+                        op.Name.Contains("conv"))
+                    {
+                        hasMath = true;
+                        break;
+                    }
+                }
+
+                if (!hasMath) continue;
+
+                if (instr0.OpCode == OpCodes.Ldflda)
+                {
+                    var fr = (FieldReference)instr0.Operand;
+                    il.InsertBefore(instr0, il.Create(OpCodes.Ldarg_0));
+                    instr0.OpCode = OpCodes.Ldfld;
+                    instrSt.OpCode = OpCodes.Stfld;
+                    instrSt.Operand = fr;
+                }
+                else if (instr0.OpCode == OpCodes.Ldarga || instr0.OpCode == OpCodes.Ldarga_S)
+                {
+                    var arg = instr0.Operand;
+                    instr0.OpCode = (arg is ParameterDefinition p && p.Index <= 3) ? GetLdargMacro(p.Index) : OpCodes.Ldarg_S;
+                    instrSt.OpCode = OpCodes.Starg_S;
+                    instrSt.Operand = arg;
+                }
+                else if (instr0.OpCode == OpCodes.Ldloca || instr0.OpCode == OpCodes.Ldloca_S)
+                {
+                    var loc = instr0.Operand;
+                    instr0.OpCode = (loc is VariableDefinition v && v.Index <= 3) ? GetLdlocMacro(v.Index) : OpCodes.Ldloc_S;
+                    instrSt.OpCode = OpCodes.Stloc_S;
+                    instrSt.Operand = loc;
+                }
+
+                il.Remove(instructions[i + 2]); // Ldind/Ldobj
+                il.Remove(instructions[i + 1]); // Dup
+                
+                revertedCount++;
+                i = stIdx;
+            }
+            catch { }
+        }
+
+        // Pass 2: Simplify all general [addr -> deref] pairs to direct loads
+        for (int i = 0; i < instructions.Count - 1; i++)
+        {
+            try
+            {
+                var instr0 = instructions[i];
+                var instr1 = instructions[i + 1];
+
+                if (instr1.OpCode.Name.StartsWith("ldind") || instr1.OpCode == OpCodes.Ldobj)
+                {
+                    if (instr0.OpCode == OpCodes.Ldflda)
+                    {
+                        var fr = (FieldReference)instr0.Operand;
+                        il.InsertBefore(instr0, il.Create(OpCodes.Ldarg_0));
+                        instr0.OpCode = OpCodes.Ldfld;
+                        il.Remove(instr1);
+                        revertedCount++;
+                    }
+                    else if (instr0.OpCode == OpCodes.Ldarga || instr0.OpCode == OpCodes.Ldarga_S)
+                    {
+                        var arg = instr0.Operand;
+                        instr0.OpCode = (arg is ParameterDefinition p && p.Index <= 3) ? GetLdargMacro(p.Index) : OpCodes.Ldarg_S;
+                        il.Remove(instr1);
+                        revertedCount++;
+                    }
+                    else if (instr0.OpCode == OpCodes.Ldloca || instr0.OpCode == OpCodes.Ldloca_S)
+                    {
+                        var loc = instr0.Operand;
+                        instr0.OpCode = (loc is VariableDefinition v && v.Index <= 3) ? GetLdlocMacro(v.Index) : OpCodes.Ldloc_S;
+                        il.Remove(instr1);
+                        revertedCount++;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        return revertedCount;
+    }
+
+    private static OpCode GetLdargMacro(int index) => index switch { 0 => OpCodes.Ldarg_0, 1 => OpCodes.Ldarg_1, 2 => OpCodes.Ldarg_2, 3 => OpCodes.Ldarg_3, _ => OpCodes.Ldarg_S };
+    private static OpCode GetLdlocMacro(int index) => index switch { 0 => OpCodes.Ldloc_0, 1 => OpCodes.Ldloc_1, 2 => OpCodes.Ldloc_2, 3 => OpCodes.Ldloc_3, _ => OpCodes.Ldloc_S };
 
     /// <summary>
     /// Attempt to patch stack underflows by replacing instructions that
@@ -5539,20 +5843,24 @@ class DeweaverEngine
             if (!type.IsValueType) continue;
 
             // Find all backing fields created by the deweaver for [Networked] properties
+            // Must check BOTH naming conventions: <PropName>k__BackingField and _camelCase
             var backingFields = type.Fields
-                .Where(f => f.Name.EndsWith(">k__BackingField"))
+                .Where(f => f.Name.EndsWith(">k__BackingField") ||
+                            (f.Name.StartsWith("_") && SafeHasAttribute(f, "CompilerGeneratedAttribute")))
+                .Where(f => !f.IsStatic)
                 .ToList();
 
             if (backingFields.Count == 0) continue;
 
             // Check which fields are already assigned in constructors
+            var backingFieldNames = new HashSet<string>(backingFields.Select(f => f.Name));
             var assignedFields = new HashSet<string>();
             foreach (var ctor in type.Methods.Where(m => m.IsConstructor && !m.IsStatic && m.Body != null))
             {
                 foreach (var instr in ctor.Body.Instructions)
                 {
                     if ((instr.OpCode == OpCodes.Stfld || instr.OpCode == OpCodes.Ldflda || instr.OpCode == OpCodes.Ldfld) &&
-                        instr.Operand is FieldReference fr && fr.Name.EndsWith(">k__BackingField"))
+                        instr.Operand is FieldReference fr && backingFieldNames.Contains(fr.Name))
                     {
                         assignedFields.Add(fr.Name);
                     }
@@ -5576,10 +5884,9 @@ class DeweaverEngine
                 type.Methods.Add(paramlessCtor);
 
                 var il = paramlessCtor.Body.GetILProcessor();
-                // For structs, the default ctor needs to init all fields
-                // First emit initobj on this to zero-initialize
-                il.Emit(OpCodes.Ldarg_0);
-                il.Emit(OpCodes.Initobj, _module.ImportReference(type));
+                // For structs, we cannot use initobj on 'this' inside a ctor (invalid IL).
+                // Instead, we just return immediately — the CLR zeros all struct fields by default.
+                // Individual field initializations will be added below for unassigned backing fields.
                 il.Emit(OpCodes.Ret);
                 paramlessCtor.Body.InitLocals = true;
                 Console.WriteLine($"  Created parameterless constructor for {type.Name}");
