@@ -9,7 +9,7 @@ using Mono.Collections.Generic;
 namespace FusionDeweaver;
 
 /// <summary>
-/// Photon Fusion 1 &amp; 2 IL De-Weaver Tool (Diamond Edition v8 - Zero Stub)
+/// Photon Fusion 1 &amp; 2 IL De-Weaver Tool (Diamond Edition v8.1 - Zero Stub + Final IL Cleanup)
 /// Reverses all IL weaving transformations performed by Fusion's ILWeaver/ILPostProcessor.
 /// Every pattern is derived from the exact Fusion.CodeGen.cs weaver source code.
 /// Supports both Fusion 1 (legacy) and Fusion 2 (2.0.4-2.0.8+) weaving patterns.
@@ -54,7 +54,7 @@ class Program
 
         if (args.Length < 2)
         {
-            Console.WriteLine("FusionDeweaver - Photon Fusion 1 & 2 IL De-Weaver (Diamond Edition v8 - Zero Stub - 100% Source-Code Recovery)");
+            Console.WriteLine("FusionDeweaver - Photon Fusion 1 & 2 IL De-Weaver (Diamond Edition v8.1 - Zero Stub + Final IL Cleanup)");
             Console.WriteLine("Usage: FusionDeweaver <input.dll> <output.dll> [fusion_dll_dir]");
             Console.WriteLine();
             Console.WriteLine("  input.dll       - Woven assembly (e.g., Assembly-CSharp.dll)");
@@ -99,6 +99,13 @@ class DeweaverEngine
 
     // Track newly created backing fields so we can reference them correctly
     private readonly Dictionary<string, FieldDefinition> _newBackingFields = new();
+
+    // Preserve original TypeReferences to prevent Cecil from removing them during write.
+    // When Cecil writes an assembly, it only includes TypeReferences that are reachable
+    // from the code. If the deweaver removes the only reference to a type, Cecil drops
+    // the TypeRef entry, causing ICSharpCode.Decompiler to produce
+    // "Unknown result type" comments.
+    private HashSet<string>? _originalTypeRefNames;
 
     // Fusion version detection
     private bool _isFusion2;
@@ -147,7 +154,6 @@ class DeweaverEngine
     private int _migratedAttributes;
     private int _unwrappedProxyAttributes;
     private int _recoveredCtorAssignments;
-    private MethodDefinition? _currentMethod;
     private int _retainILPropertiesPreserved;
     private int _restoredCollectionInits;
     private int _removedNetworkAssemblyIgnore;
@@ -162,14 +168,28 @@ class DeweaverEngine
     private int _migratedFieldAccuracyAttrs;
     private int _migratedFieldCapacityAttrs;
     private int _accessorCompilerGeneratedAttrs;
+    private int _createdSetters;
     private int _scrubbedOrphanedFusionTypeRefs;
     private int _importSanitizedRefs;
     private int _stackNeutralReplacements;
     private int _invalidMethodBodiesFixed;
+    private int _stackMergeFixes;
+    private int _deadBranchesFixed;
+    private int _deadSequencesCleaned;
 
     // Track which NetworkBehaviour types were processed by the deweaver
     // Used by Step 18 to distinguish deweaver-modified methods from pre-existing IL patterns
     private readonly HashSet<string> _processedNetworkBehaviours = new();
+
+    // Track which SPECIFIC methods were actually modified by the deweaver.
+    // Used by WasMethodModifiedByDeweaver() to avoid running IL cleanup on unmodified methods.
+    private readonly HashSet<string> _modifiedMethods = new();
+
+    /// <summary>Record that a method was modified by the deweaver.</summary>
+    private void MarkMethodModified(MethodDefinition method)
+    {
+        _modifiedMethods.Add($"{method.DeclaringType.FullName}::{method.Name}");
+    }
 
     // Captured initialization instructions from CopyBackingFieldsToState, keyed by type fullname
     private readonly Dictionary<string, List<Instruction>> _capturedCtorInits = new();
@@ -186,7 +206,7 @@ class DeweaverEngine
         Console.WriteLine($"[Deweaver] Loading assembly: {_inputPath}");
 
         _resolver = new TolerantAssemblyResolver(new DefaultAssemblyResolver());
-        _resolver.AddSearchDirectory(Path.GetDirectoryName(_inputPath));
+        _resolver.AddSearchDirectory(Path.GetDirectoryName(_inputPath) ?? ".");
         _resolver.AddSearchDirectory(_fusionDir);
         if (Directory.Exists(_fusionDir))
         {
@@ -202,8 +222,12 @@ class DeweaverEngine
             ReadingMode = ReadingMode.Deferred
         });
         _module = _asm.MainModule;
+        PreResolveCoreLibraries();
 
-        Console.WriteLine("[Deweaver] Assembly loaded successfully.");
+        // CRITICAL: Capture all original TypeReference names BEFORE any deweaving steps.
+        _originalTypeRefNames = new HashSet<string>(
+            _module.GetTypeReferences().Select(tr => tr.FullName));
+        Console.WriteLine($"[Deweaver] Assembly loaded. {_originalTypeRefNames.Count} TypeRefs captured.");
 
         // Detect Fusion version
         DetectFusionVersion();
@@ -238,8 +262,17 @@ class DeweaverEngine
         RunStep("Step 14", Step14_RemoveInvalidRefReturnSetters);
         RunStep("Step 15", Step15_EnsureStructBackingFieldInit);
         RunStep("Step 16", Step16_SanitizeTrivialConstructors);
+        RunStep("Step 16b", Step16b_FixGlobalILArtifacts);
         RunStep("Step 17", Step17_SanitizeCrossModuleReferences);
         RunStep("Step 18", Step18_ValidateAndFixMethodBodies);
+        RunStep("Step 19", Step19_FinalILCleanup);
+        RunStep("Step 20", Step20_SanitizeUnsafePointerConversions);
+
+        // CRITICAL: Preserve all original TypeReferences before writing.
+        // Cecil's writer only includes TypeReferences reachable from code/metadata.
+        // Missing TypeRefs cause ICSharpCode.Decompiler v10 to produce
+        // "Unknown result type" comments in decompiled output.
+        PreserveOriginalTypeReferences();
 
         Console.WriteLine($"[Deweaver] Writing output: {_outputPath}");
         Directory.CreateDirectory(Path.GetDirectoryName(_outputPath)!);
@@ -271,6 +304,20 @@ class DeweaverEngine
     }
 
     #region Fusion Version Detection
+
+    private void PreResolveCoreLibraries()
+    {
+        string[] coreLibs = { "mscorlib", "System.Runtime", "System", "System.Core", "netstandard", "System.Private.CoreLib" };
+        foreach (var lib in coreLibs)
+        {
+            try
+            {
+                var name = new AssemblyNameReference(lib, new Version(0, 0, 0, 0));
+                _resolver.Resolve(name);
+            }
+            catch { }
+        }
+    }
 
     private void RunStep(string name, Action step)
     {
@@ -568,21 +615,34 @@ class DeweaverEngine
                 bodyInstrs.Add(instructions[i]);
         }
 
-        if (bodyInstrs.Count == 0) return;
-
+        // Bug R: Even if body is empty, we must continue to ensure the method 
+        // is restored to a clean Ret or Default Return to avoid leaving weaver logic behind.
+        // if (bodyInstrs.Count == 0) return;
+        
         bool returnsRpcInvokeInfo = method.ReturnType.Name == "RpcInvokeInfo";
-
-        // Clear instructions and exception handlers, but KEEP all variables
-        method.Body.Instructions.Clear();
-        method.Body.ExceptionHandlers.Clear();
 
         var il = method.Body.GetILProcessor();
 
-        foreach (var instr in bodyInstrs)
+        // Bug AC: Preserve ExceptionHandlers! Do not use Instructions.Clear() or ExceptionHandlers.Clear()
+        // Instead, safely remove instructions that belong to the weaver's dispatch/send logic.
+        var bodySet = new HashSet<Instruction>(bodyInstrs);
+        var toRemove = new List<Instruction>();
+        
+        foreach (var instr in method.Body.Instructions)
         {
-            if (returnsRpcInvokeInfo && instr.OpCode == OpCodes.Pop)
-                continue;
-            il.Append(instr);
+            if (!bodySet.Contains(instr))
+            {
+                toRemove.Add(instr);
+            }
+            else if (returnsRpcInvokeInfo && instr.OpCode == OpCodes.Pop)
+            {
+                toRemove.Add(instr);
+            }
+        }
+
+        foreach (var instr in toRemove)
+        {
+            il.Remove(instr);
         }
 
         // Ensure proper return
@@ -608,7 +668,28 @@ class DeweaverEngine
             }
         }
 
+        MarkMethodModified(method);
         _restoredRpcMethods++;
+        
+        // Bug B: Remap branch targets that point outside the new body to prevent invalid IL
+        var newInstructions = method.Body.Instructions;
+        var instructionSet = new HashSet<Instruction>(newInstructions);
+        foreach (var instr in newInstructions)
+        {
+            if (instr.Operand is Instruction branchTarget && !instructionSet.Contains(branchTarget))
+            {
+                instr.Operand = newInstructions.Last(); // Fallback to last instruction (usually Ret)
+            }
+            else if (instr.Operand is Instruction[] targets)
+            {
+                for (int i = 0; i < targets.Length; i++)
+                {
+                    if (!instructionSet.Contains(targets[i]))
+                        targets[i] = newInstructions.Last();
+                }
+            }
+        }
+
         Console.WriteLine($"  Restored RPC: {type.Name}::{method.Name} (static={isStaticRpc})");
     }
 
@@ -636,7 +717,7 @@ class DeweaverEngine
                 instructions[i + 1].OpCode == OpCodes.Ldfld &&
                 instructions[i + 1].Operand is FieldReference fr &&
                 fr.Name == "InvokeRpc" &&
-                fr.DeclaringType.Name == "NetworkBehaviour")
+                fr.DeclaringType.Name.EndsWith("NetworkBehaviour"))
             {
                 return true;
             }
@@ -675,7 +756,7 @@ class DeweaverEngine
 
     private int FindInvokePathStart(Collection<Instruction> instructions, int brfalseIndex, bool isStatic)
     {
-        for (int i = brfalseIndex + 1; i < Math.Min(brfalseIndex + 10, instructions.Count); i++)
+        for (int i = brfalseIndex + 1; i < Math.Min(brfalseIndex + 25, instructions.Count); i++)
         {
             if (instructions[i].OpCode == OpCodes.Nop)
             {
@@ -692,7 +773,7 @@ class DeweaverEngine
         }
 
         bool pastReset = false;
-        for (int i = brfalseIndex + 1; i < Math.Min(brfalseIndex + 15, instructions.Count); i++)
+        for (int i = brfalseIndex + 1; i < Math.Min(brfalseIndex + 30, instructions.Count); i++)
         {
             var instr = instructions[i];
             if (instr.OpCode == OpCodes.Stfld && instr.Operand is FieldReference f && f.Name == "InvokeRpc")
@@ -857,25 +938,18 @@ class DeweaverEngine
 
         foreach (var prop in networkedProps)
         {
-            // De-obfuscate backing field name: strip C# special characters from <PropName>k__BackingField
-            // Convert to _propName (camelCase) if not taken, otherwise use standard k__BackingField with [CompilerGenerated]
-            var obfuscatedName = $"<{prop.Name}>k__BackingField";
-            var camelName = char.ToLowerInvariant(prop.Name[0]) + prop.Name.Substring(1);
-            var normalizedName = $"_{camelName}";
-            
-            // Check if normalized name is already taken
-            string backingName;
-            if (type.Fields.Any(f => f.Name == normalizedName))
-            {
-                // Use standard k__BackingField pattern but ensure [CompilerGenerated] is applied
-                backingName = obfuscatedName;
-            }
-            else
-            {
-                // Prefer cleaner _propName format
-                backingName = normalizedName;
-            }
-            
+            // Always use the standard C# auto-property backing field naming convention:
+            // <PropName>k__BackingField. This ensures ICSharpCode.Decompiler recognizes
+            // the field as a backing field and emits the property as an auto-property
+            // (e.g., "public string NickName { get; set; }") instead of an expression-bodied
+            // property referencing a separate private field.
+            //
+            // Previous versions used _camelCase naming (_nickName) which prevented the
+            // decompiler from recognizing auto-properties, producing ugly output like
+            // "public NetData Data => _data;" with a separate private field declaration.
+            var backingName = $"<{prop.Name}>k__BackingField";
+
+            // Only skip if a field with this exact name already exists
             if (type.Fields.Any(f => f.Name == backingName))
                 continue;
 
@@ -1026,8 +1100,7 @@ class DeweaverEngine
                 // However, CreateBackingFieldsForNetworkedProperties may have created it as _propName
                 // if the original was removed. We must check BOTH naming conventions.
                 var backingName = $"<{prop.Name}>k__BackingField";
-                var camelName = char.ToLowerInvariant(prop.Name[0]) + prop.Name.Substring(1);
-                var altBackingName = $"_{camelName}";
+                var altBackingName = $"_{prop.Name}";
 
                 var backingField = type.Fields.FirstOrDefault(f => f.Name == backingName)
                                  ?? type.Fields.FirstOrDefault(f => f.Name == altBackingName);
@@ -1074,6 +1147,7 @@ class DeweaverEngine
                         {
                             // Getter was also obliterated - restore it normally
                             if (prop.GetMethod?.Body == null) goto PropertyRestored;
+                            ClearReadOnlyGetterAttribute(prop.GetMethod);
                             var fieldRef = _module.ImportReference(backingField);
                             var il = prop.GetMethod.Body.GetILProcessor();
                             prop.GetMethod.Body.Instructions.Clear();
@@ -1082,6 +1156,7 @@ class DeweaverEngine
                             il.Emit(OpCodes.Ldarg_0);
                             il.Emit(OpCodes.Ldfld, fieldRef);
                             il.Emit(OpCodes.Ret);
+                            MarkMethodModified(prop.GetMethod);
                             EnsureCompilerGeneratedOnMethod(prop.GetMethod);
                             _restoredPropertyBodies++;
                         }
@@ -1095,11 +1170,27 @@ class DeweaverEngine
 
                 if (backingField != null)
                 {
+                    // If the backing field uses an alternative name (e.g. _CurrentState),
+                    // rename it to the standard C# auto-property name (<CurrentState>k__BackingField).
+                    // This is critical for ICSharpCode.Decompiler to fold it into an auto-property.
+                    if (backingField.Name != backingName)
+                    {
+                        Console.WriteLine($"    Renaming non-standard backing field: {backingField.Name} -> {backingName}");
+                        RenameFieldAndFixReferences(type, backingField, backingName);
+                    }
+
+                    // Ensure the backing field has correct metadata for auto-property recognition.
+                    EnsureBackingFieldMetadata(backingField);
+
                     var fieldRef = _module.ImportReference(backingField);
 
                     // Restore getter to simple: return this.backingField;
                     if (prop.GetMethod != null && prop.GetMethod.Body != null)
                     {
+                        // Clear IsReadOnly flag — Fusion adds 'readonly get' which prevents
+                        // ICSharpCode.Decompiler from folding into auto-properties.
+                        ClearReadOnlyGetterAttribute(prop.GetMethod);
+
                         var il = prop.GetMethod.Body.GetILProcessor();
                         prop.GetMethod.Body.Instructions.Clear();
                         prop.GetMethod.Body.Variables.Clear();
@@ -1110,6 +1201,7 @@ class DeweaverEngine
 
                         // Ensure [CompilerGenerated] on the getter for perfect C# auto-property output
                         EnsureCompilerGeneratedOnMethod(prop.GetMethod);
+                        MarkMethodModified(prop.GetMethod);
 
                         _restoredPropertyBodies++;
                     }
@@ -1117,10 +1209,11 @@ class DeweaverEngine
                     // Restore setter to simple: this.backingField = value;
                     if (prop.SetMethod != null && prop.SetMethod.Body != null)
                     {
-                        var il = prop.SetMethod.Body.GetILProcessor();
-                        prop.SetMethod.Body.Instructions.Clear();
-                        prop.SetMethod.Body.Variables.Clear();
-                        prop.SetMethod.Body.ExceptionHandlers.Clear();
+                        var setBody = prop.SetMethod.Body;
+                        var il = setBody.GetILProcessor();
+                        setBody.Instructions.Clear();
+                        setBody.Variables.Clear();
+                        setBody.ExceptionHandlers.Clear();
                         il.Emit(OpCodes.Ldarg_0);
                         il.Emit(OpCodes.Ldarg_1);
                         il.Emit(OpCodes.Stfld, fieldRef);
@@ -1128,7 +1221,17 @@ class DeweaverEngine
 
                         // Ensure [CompilerGenerated] on the setter for perfect C# auto-property output
                         EnsureCompilerGeneratedOnMethod(prop.SetMethod);
+                        MarkMethodModified(prop.SetMethod);
 
+                        _restoredPropertyBodies++;
+                    }
+                    else if (prop.SetMethod == null && prop.GetMethod != null)
+                    {
+                        // Get-only property: Fusion removed the setter. Create a simple setter
+                        // so ICSharpCode.Decompiler can fold into auto-property { get; set; }.
+                        // For [Networked] properties, a setter is expected (Fusion sets them
+                        // during state synchronization).
+                        CreateSimpleSetter(prop, backingField);
                         _restoredPropertyBodies++;
                     }
                 }
@@ -1389,7 +1492,8 @@ class DeweaverEngine
         }
 
         _removedPtrNullChecks++;
-        Console.WriteLine($"    Stripped Ptr null check from {type.Name}.{propName}.{(accessor.IsGetter ? "get" : "set")}");
+        if (accessor != null) MarkMethodModified(accessor);
+        Console.WriteLine($"    Stripped Ptr null check from {type.Name}.{propName}.{(accessor?.IsGetter == true ? "get" : "set")}");
     }
 
     private static bool IsBrfalse(OpCode op) => op == OpCodes.Brfalse || op == OpCodes.Brfalse_S;
@@ -1440,7 +1544,28 @@ class DeweaverEngine
             // so we also check for [DefaultForPropertyAttribute] as the primary indicator.
             bool hasDefaultForProperty = SafeHasAttribute(defaultField, "DefaultForPropertyAttribute");
             bool isWeaverGenerated = SafeHasAttribute(defaultField, "WeaverGeneratedAttribute");
-            bool shouldRemove = isWeaverGenerated || hasDefaultForProperty;
+            
+            // Bug D Fix: If the field is referenced by [Networked(Default = "_fieldName")], it's user-defined
+            bool isUserDefaultField = false;
+            var networkedAttr = prop.CustomAttributes.FirstOrDefault(a => a.AttributeType.Name == "NetworkedAttribute");
+            if (networkedAttr != null)
+            {
+                string? defaultFieldNameInAttr = null;
+                foreach (var na in networkedAttr.Properties)
+                {
+                    if (na.Name == "Default")
+                    {
+                        defaultFieldNameInAttr = na.Argument.Value as string;
+                        break;
+                    }
+                }
+                if (defaultFieldNameInAttr == defaultField.Name)
+                {
+                    isUserDefaultField = true;
+                }
+            }
+
+            bool shouldRemove = !isUserDefaultField && (isWeaverGenerated || hasDefaultForProperty);
 
             if (shouldRemove)
             {
@@ -1500,13 +1625,12 @@ class DeweaverEngine
                                               p.ParameterType.FullName.Contains("SimulationDataPtr")))
             .ToList();
 
-        // Fallback: also remove if they have WeaverGeneratedAttribute OR DefaultForPropertyAttribute
-        // (DefaultForPropertyAttribute is added by the weaver per CodeGen line 2501)
+        // Fallback: also remove if they have WeaverGeneratedAttribute
+        // (DefaultForPropertyAttribute is ONLY for fields, checking it on methods causes false positives)
         var weaverGeneratedMethods = type.Methods
             .Where(m => (m.Name == "CopyBackingFieldsToState" || m.Name == "CopyStateToBackingFields" ||
                          m.Name == "CopyAllBackingFieldsToState" || m.Name == "CopyAllStateToBackingFields") &&
-                        (m.CustomAttributes.Any(a => a.AttributeType.Name == "WeaverGeneratedAttribute") ||
-                         m.CustomAttributes.Any(a => a.AttributeType.Name == "DefaultForPropertyAttribute")))
+                        (m.CustomAttributes.Any(a => a.AttributeType.Name == "WeaverGeneratedAttribute")))
             .ToList();
 
         var allToRemove = methods.Union(weaverGeneratedMethods).ToList();
@@ -1551,6 +1675,7 @@ class DeweaverEngine
                     try { ReplaceInstructionWithStackNeutral(il, instr, false); }
                     catch { try { il.Remove(instr); } catch { } }
                 }
+                MarkMethodModified(method);
                 Console.WriteLine($"    Stripped {toRemove.Count} InvokeWeavedCode() call(s) from {type.Name}::{method.Name}");
             }
         }
@@ -1571,7 +1696,8 @@ class DeweaverEngine
     /// </summary>
     private void StripInternalOnCalls(TypeDefinition type)
     {
-        if (!_isFusion2) return;
+        // Bug E: Remove _isFusion2 gate as these calls are injected in Fusion 1.x as well
+        // if (!_isFusion2) return;
 
         var messageMethods = new[] { "OnDestroy", "OnEnable", "OnDisable" };
         var internalNames = new Dictionary<string, string>
@@ -1598,6 +1724,8 @@ class DeweaverEngine
                 var il = method.Body.GetILProcessor();
                 il.Remove(instructions[1]); // Remove Call first (higher index)
                 il.Remove(instructions[0]); // Then remove Ldarg_0
+                // Note: No MarkMethodModified here. Removing a Ldarg_0 + void call pair
+                // is stack-neutral and doesn't require Step 18/19 IL cleanup.
                 _removedInternalOnCalls++;
                 Console.WriteLine($"    Stripped InternalOn call from {type.Name}::{msgName}()");
             }
@@ -1913,7 +2041,11 @@ class DeweaverEngine
             // These appear at the top of constructors after base() call
             StripDoubleInitPatterns(ctor, type);
 
-            if (modified) { _restoredConstructors++; }
+            if (modified)
+            {
+                MarkMethodModified(ctor);
+                _restoredConstructors++;
+            }
         }
     }
 
@@ -2190,26 +2322,16 @@ class DeweaverEngine
         Console.WriteLine("[Step 3c] Unwrapping UnityPropertyAttributeProxy attributes...");
         foreach (var type in GetAllTypes())
         {
-            // Skip types already processed in Step 3 (ProcessNetworkBehaviourWeaving)
-            if (_processedNetworkBehaviours.Contains(type.FullName))
-            {
-                // Still need to handle struct types though
-                if (!ImplementsInterface(type, "INetworkStruct") && !ImplementsInterface(type, "INetworkInput"))
-                    continue;
-            }
+            // Skip types already processed in Step 3 (ProcessNetworkBehaviourWeaving),
+            // UNLESS they are struct types (INetworkStruct/INetworkInput) which Step 3 skips.
+            bool alreadyProcessed = _processedNetworkBehaviours.Contains(type.FullName);
+            bool isStructType = ImplementsInterface(type, "INetworkStruct") || ImplementsInterface(type, "INetworkInput");
 
-            if (IsNetworkBehaviour(type))
-            {
-                try { UnwrapProxyAttributesOnProperties(type); }
-                catch (Exception ex) { Console.WriteLine($"  WARNING: UnwrapProxyAttributes failed for {type.FullName}: {ex.Message}"); }
-            }
+            if (alreadyProcessed && !isStructType)
+                continue;
 
-            // Also unwrap proxies on struct types
-            if (ImplementsInterface(type, "INetworkStruct") || ImplementsInterface(type, "INetworkInput"))
-            {
-                try { UnwrapProxyAttributesOnProperties(type); }
-                catch (Exception ex) { Console.WriteLine($"  WARNING: UnwrapProxyAttributes failed for struct {type.FullName}: {ex.Message}"); }
-            }
+            try { UnwrapProxyAttributesOnProperties(type); }
+            catch (Exception ex) { Console.WriteLine($"  WARNING: UnwrapProxyAttributes failed for {type.FullName}: {ex.Message}"); }
         }
     }
 
@@ -2279,13 +2401,22 @@ class DeweaverEngine
         var realCtorArgs = proxyAttr.ConstructorArguments.Skip(1).ToList();
 
         // Find a matching constructor on the real attribute type
+        // Match by both parameter count AND type compatibility to avoid
+        // selecting the wrong overload when multiple constructors have the
+        // same parameter count but different types (e.g., Header(string) vs Header(int)).
         MethodDefinition? matchingCtor = null;
         foreach (var ctor in realAttrTypeDef.Methods.Where(m => m.IsConstructor && !m.IsStatic))
         {
             if (ctor.Parameters.Count == realCtorArgs.Count)
             {
-                matchingCtor = ctor;
-                break;
+                bool typesMatch = ctor.Parameters
+                    .Zip(realCtorArgs, (p, a) => IsTypeCompatible(p.ParameterType, a))
+                    .All(x => x);
+                if (typesMatch)
+                {
+                    matchingCtor = ctor;
+                    break;
+                }
             }
         }
 
@@ -2629,8 +2760,12 @@ class DeweaverEngine
                     // Actually, insert BEFORE the Ldarg_0 that starts the base() call sequence
                     int insertAt = baseCallIndex;
 
-                    // Look back for the start of the base() call sequence
-                    for (int k = baseCallIndex - 1; k >= 0; k--)
+                    // Look back for the start of the base() call sequence.
+                    // The Ldarg_0 for a base() call is always its immediate predecessor
+                    // (at most 2 instructions back: Ldarg_0 + potential nop).
+                    // Limiting the walk-back prevents finding unrelated Ldarg_0 from
+                    // field assignments before the base() call.
+                    for (int k = baseCallIndex - 1; k >= Math.Max(0, baseCallIndex - 2); k--)
                     {
                         if (ctor.Body.Instructions[k].OpCode == OpCodes.Ldarg_0)
                         {
@@ -2832,20 +2967,77 @@ class DeweaverEngine
                 }
             }
 
-            // Pattern 3: Calls to NetworkBehaviourUtils.InitializeNetworkArray/InitializeNetworkList/InitializeNetworkDictionary
-            // These are generated in CopyBackingFieldsToState and should be removed
+            // Pattern 3 & 4: Calls to NetworkBehaviourUtils.InitializeNetwork... and CopyFromNetwork...
+            // These are generated in CopyBackingFieldsToState and should be entirely removed
+            // to avoid leaving garbage instruction sequences (which result in `var _ = ...` when popped).
             if (instr.OpCode == OpCodes.Call && instr.Operand is MethodReference mr3 &&
                 mr3.DeclaringType.Name == "NetworkBehaviourUtils" &&
-                (mr3.Name == "InitializeNetworkArray" || mr3.Name == "InitializeNetworkList" ||
-                 mr3.Name == "InitializeNetworkDictionary"))
+                (mr3.Name.StartsWith("InitializeNetwork") || mr3.Name.StartsWith("CopyFromNetwork")))
             {
-                toRemove.Add(instr);
-                // Also need to remove the arguments pushed for this call
-                // The pattern is: Ldarg_0, Call getter, <arg>, Ldstr, Call InitializeNetworkArray
-                // We need to remove the Ldstr and the arg instructions
-                // This is tricky - for now just remove the call and let dead code elimination handle the args
-                _restoredCollectionInits++;
-                Console.WriteLine($"    Removed {mr3.Name} call in {type.Name}::{method.Name}");
+                // Pattern is typically:
+                // Ldarg_0
+                // Call get_Prop
+                // <arguments...>
+                // Call Initialize/Copy
+                
+                int startIdx = -1;
+                string propName = null;
+                
+                // For Initialize, Ldstr is usually right before the call
+                if (i - 1 >= 0 && instructions[i - 1].OpCode == OpCodes.Ldstr)
+                {
+                    propName = instructions[i - 1].Operand as string;
+                }
+                
+                // If we didn't find Ldstr (e.g. CopyFrom), look backwards for the first getter call
+                if (propName == null)
+                {
+                    for (int j = i - 1; j >= 0; j--)
+                    {
+                        if (instructions[j].OpCode == OpCodes.Call &&
+                            instructions[j].Operand is MethodReference getMr &&
+                            getMr.Name.StartsWith("get_"))
+                        {
+                            propName = getMr.Name.Substring(4);
+                            break;
+                        }
+                    }
+                }
+
+                if (propName != null)
+                {
+                    for (int j = i - 1; j >= 0; j--)
+                    {
+                        if (instructions[j].OpCode == OpCodes.Ldarg_0 &&
+                            j + 1 < instructions.Count &&
+                            instructions[j + 1].OpCode == OpCodes.Call &&
+                            instructions[j + 1].Operand is MethodReference getMr &&
+                            getMr.Name == $"get_{propName}")
+                        {
+                            startIdx = j;
+                            break;
+                        }
+                    }
+                }
+
+                if (startIdx != -1)
+                {
+                    for (int j = startIdx; j <= i; j++)
+                    {
+                        if (!toRemove.Contains(instructions[j]))
+                            toRemove.Add(instructions[j]);
+                    }
+                    _restoredCollectionInits++;
+                    Console.WriteLine($"    Removed full {mr3.Name} sequence for {propName} in {type.Name}::{method.Name}");
+                    continue; // Skip the rest, we handled it
+                }
+                else
+                {
+                    // Fallback to basic removal (stack-neutral replacement will handle args)
+                    toRemove.Add(instr);
+                    _restoredCollectionInits++;
+                    Console.WriteLine($"    Removed {mr3.Name} call (fallback) in {type.Name}::{method.Name}");
+                }
             }
 
             // Pattern 5: Calls to NetworkBehaviour.MakeRef<T>() and NetworkBehaviour.MakePtr<T>()
@@ -2869,17 +3061,6 @@ class DeweaverEngine
                 }
 
                 Console.WriteLine($"    Removed MakeRef/MakePtr call in {type.Name}::{method.Name}");
-            }
-
-            // Pattern 4: Calls to NetworkBehaviourUtils.CopyFromNetworkArray/CopyFromNetworkList/CopyFromNetworkDictionary
-            if (instr.OpCode == OpCodes.Call && instr.Operand is MethodReference mr4 &&
-                mr4.DeclaringType.Name == "NetworkBehaviourUtils" &&
-                (mr4.Name == "CopyFromNetworkArray" || mr4.Name == "CopyFromNetworkList" ||
-                 mr4.Name == "CopyFromNetworkDictionary"))
-            {
-                toRemove.Add(instr);
-                _restoredCollectionInits++;
-                Console.WriteLine($"    Removed {mr4.Name} call in {type.Name}::{method.Name}");
             }
         }
 
@@ -3104,10 +3285,17 @@ class DeweaverEngine
             var backingField = type.Fields.FirstOrDefault(f => f.Name == backingName)
                              ?? type.Fields.FirstOrDefault(f => f.Name == camelCaseName);
             if (backingField == null) continue;
+
+            // Ensure backing field has correct metadata for auto-property recognition
+            EnsureBackingFieldMetadata(backingField);
+
             var fieldRef = _module.ImportReference(backingField);
 
             if (prop.GetMethod != null && prop.GetMethod.Body != null)
             {
+                // Clear IsReadOnly — Fusion adds 'readonly get' preventing auto-property folding
+                ClearReadOnlyGetterAttribute(prop.GetMethod);
+
                 var il = prop.GetMethod.Body.GetILProcessor();
                 prop.GetMethod.Body.Instructions.Clear();
                 prop.GetMethod.Body.Variables.Clear();
@@ -3116,22 +3304,30 @@ class DeweaverEngine
                 il.Emit(OpCodes.Ldfld, fieldRef);
                 il.Emit(OpCodes.Ret);
                 EnsureCompilerGeneratedOnMethod(prop.GetMethod);
+                MarkMethodModified(prop.GetMethod);
                 _restoredPropertyBodies++;
             }
             if (prop.SetMethod != null && prop.SetMethod.Body != null)
             {
-                var il = prop.SetMethod.Body.GetILProcessor();
-                prop.SetMethod.Body.Instructions.Clear();
-                prop.SetMethod.Body.Variables.Clear();
-                prop.SetMethod.Body.ExceptionHandlers.Clear();
+                var setBody = prop.SetMethod.Body;
+                var il = setBody.GetILProcessor();
+                setBody.Instructions.Clear();
+                setBody.Variables.Clear();
+                setBody.ExceptionHandlers.Clear();
                 il.Emit(OpCodes.Ldarg_0);
                 il.Emit(OpCodes.Ldarg_1);
                 il.Emit(OpCodes.Stfld, fieldRef);
                 il.Emit(OpCodes.Ret);
                 EnsureCompilerGeneratedOnMethod(prop.SetMethod);
+                MarkMethodModified(prop.SetMethod);
                 _restoredPropertyBodies++;
             }
-
+            else if (prop.SetMethod == null && prop.GetMethod != null)
+            {
+                // Get-only struct property: create setter for auto-property folding
+                CreateSimpleSetter(prop, backingField);
+                _restoredPropertyBodies++;
+            }
             // Remove the FixedStorage/_PropName field (weaver-generated)
             // SAFETY: Never remove a field named "Ptr" - it's a core field on NetworkBehaviour
             // and some struct types, not a weaver-generated storage field.
@@ -3140,11 +3336,22 @@ class DeweaverEngine
             var fixedField = type.Fields.FirstOrDefault(f => f.Name == fixedName);
             if (fixedField != null)
             {
-                type.Fields.Remove(fixedField);
-                _removedFixedStorageFields++;
-                Console.WriteLine($"    Removed FixedStorage field: {fixedName}");
+                // Bug I Safety: Only remove if it has weaver storage indicator (FixedBufferPropertyAttribute)
+                // or if it's not a user-defined default field.
+                bool isWeaverStorage = SafeHasAttribute(fixedField, "FixedBufferPropertyAttribute") || 
+                                     SafeHasAttribute(fixedField, "WeaverGeneratedAttribute");
+                
+                if (isWeaverStorage)
+                {
+                    type.Fields.Remove(fixedField);
+                    _removedFixedStorageFields++;
+                    Console.WriteLine($"    Removed FixedStorage field: {fixedName}");
+                }
             }
         }
+
+        // Redirect existing constructor assignments to the new backing fields
+        RestoreConstructors(type);
 
         // Remove weaver-generated helper methods
         // Note: setDefaults/MakeInitializer/MakeRef/MakePtr are NOT weaver-generated method names
@@ -3272,6 +3479,20 @@ class DeweaverEngine
             _module.Types.Remove(type);
             _removedGeneratedTypes++;
             Console.WriteLine($"  Removed: {type.FullName}");
+        }
+
+        // Remove Unity DOTS/Burst job reflection registration types.
+        // These types reference internal DOTS attributes (e.g., DOTSCompilerGeneratedAttribute)
+        // that are inaccessible (CS0122) in the decompiled C# output.
+        // The game works fine without them at runtime.
+        var dotsTypes = _module.Types
+            .Where(t => t.Name.StartsWith("__JobReflectionRegistrationOutput__"))
+            .ToList();
+        foreach (var type in dotsTypes)
+        {
+            _module.Types.Remove(type);
+            _removedGeneratedTypes++;
+            Console.WriteLine($"  Removed DOTS reflection type: {type.FullName}");
         }
     }
 
@@ -3474,7 +3695,10 @@ class DeweaverEngine
             {
                 var il = cctor.Body.GetILProcessor();
                 foreach (var instr in toRemove)
-                    il.Remove(instr);
+                {
+                    // Bug V: Use Nop instead of Remove to preserve branch targets in static constructors
+                    il.Replace(instr, il.Create(OpCodes.Nop));
+                }
 
                 // Clean up empty .cctor
                 instructions = cctor.Body.Instructions;
@@ -4071,7 +4295,14 @@ class DeweaverEngine
             "DrawIfAttribute",                // Fusion 2: inspector read-only marker
             "PreserveAttribute",              // Fusion 2: added to OnChanged handlers in editor builds
             "UnityPropertyAttributeProxyAttribute", // Fusion 2: proxy for Unity property attributes
-            "NetworkAssemblyIgnoreAttribute"  // Fusion: marks assembly as not-to-be-weaved
+            "NetworkAssemblyIgnoreAttribute", // Fusion: marks assembly as not-to-be-weaved
+            "NetworkedWeavedStringAttribute",
+            "NetworkedWeavedCollectionAttribute",
+            "NetworkedWeavedRpcAttribute",
+            "NetworkedWeavedEventAttribute",
+            "NetworkedWeavedPropertyAttribute",
+            "NetworkedWeavedInputAttribute",
+            "NetworkBehaviourWeavedAttribute"
         };
 
         foreach (var type in GetAllTypes())
@@ -4433,6 +4664,48 @@ class DeweaverEngine
     }
 
     /// <summary>
+    /// Global pass to fix miscellaneous IL artifacts left behind by the weaver or by reversion.
+    /// </summary>
+    private void FixGlobalILArtifacts(TypeDefinition type)
+    {
+        foreach (var method in type.Methods.ToList())
+        {
+            if (method.Body == null) continue;
+
+            try
+            {
+                var il = method.Body.GetILProcessor();
+                var instructions = method.Body.Instructions;
+                bool modified = false;
+
+                for (int i = 0; i < instructions.Count; i++)
+                {
+                    var instr = instructions[i];
+
+                    // Fix CS0571: Remove explicit calls to implicit conversion operators
+                    // The weaver explicitly calls op_Implicit for NetworkString or ReadOnlySpan conversions.
+                    // Replace the Call instruction with a Nop to allow decompiler to see direct assignment.
+                    if (instr.OpCode == OpCodes.Call && instr.Operand is MethodReference mr && mr.Name == "op_Implicit")
+                    {
+                        var declaringTypeName = mr.DeclaringType?.Name ?? "";
+                        if (declaringTypeName.Contains("NetworkString") || declaringTypeName.Contains("ReadOnlySpan"))
+                        {
+                            il.Replace(instr, il.Create(OpCodes.Nop));
+                            modified = true;
+                        }
+                    }
+                }
+
+                if (modified)
+                {
+                    MarkMethodModified(method);
+                }
+            }
+            catch { }
+        }
+    }
+
+    /// <summary>
     /// Fix stale field reference operands in method bodies after a field's type changed
     /// from value type to reference type. This handles several critical issues:
     ///
@@ -4504,34 +4777,6 @@ class DeweaverEngine
                             continue;
                         }
                     }
-                    
-                    // Fix CS0571: Remove explicit calls to implicit conversion operators
-                    // The weaver often explicitly calls op_Implicit for NetworkString or ReadOnlySpan conversions.
-                    // Since we have reverted the underlying types to match, these calls are now identity conversions.
-                    // Replace the Call instruction with a Nop to allow decompiler to see direct assignment.
-                    if (instr.OpCode == OpCodes.Call && instr.Operand is MethodReference mr && mr.Name == "op_Implicit")
-                    {
-                        var declaringTypeName = mr.DeclaringType?.Name ?? "";
-                        if (declaringTypeName.Contains("NetworkString") || declaringTypeName.Contains("ReadOnlySpan"))
-                        {
-                            il.Replace(instr, il.Create(OpCodes.Nop));
-                            modified = true;
-                        }
-                    }
-                    
-                    // Fix CS0103: Redirect ghost function pointers (__ldftn artifacts)
-                    // Scan for ldftn instructions that reference @Invoker methods and redirect to original RPC method
-                    if (instr.OpCode == OpCodes.Ldftn && instr.Operand is MethodReference targetMr && targetMr.Name.Contains("@Invoker"))
-                    {
-                        string originalRpcName = targetMr.Name.Split('@')[0];
-                        var originalMethod = type.Methods.FirstOrDefault(m => m.Name == originalRpcName);
-                        if (originalMethod != null)
-                        {
-                            instr.Operand = _module.ImportReference(originalMethod);
-                            modified = true;
-                        }
-                    }
-
                     // Fix any Stfld/Ldfld/Ldsfld/Stsfld with stale FieldReference operands
                     // (handles both instance and static field references)
                     if ((instr.OpCode == OpCodes.Stfld || instr.OpCode == OpCodes.Ldfld ||
@@ -4662,10 +4907,24 @@ class DeweaverEngine
         // Handle ldtoken specially: it pushes 1 value (a handle)
         // When it's part of a ldtoken+GetTypeFromHandle pair, we replace with ldnull
         // since the pair's net effect is pushing 1 Type reference
+        // Handle ldtoken: it pushes a RuntimeHandle (struct)
+        // Bug AF: Replacing with ldnull for a struct is invalid. Push a zeroed struct instead.
         if (op == OpCodes.Ldtoken)
         {
-            var ldnull = il.Create(OpCodes.Ldnull);
-            il.Replace(instr, ldnull);
+            if (instr.Operand is TypeReference tr)
+            {
+                var rthVar = new VariableDefinition(_module.ImportReference(tr.Module.ImportReference(typeof(System.RuntimeTypeHandle))));
+                il.Body.Variables.Add(rthVar);
+                il.Body.InitLocals = true;
+                il.InsertBefore(instr, il.Create(OpCodes.Ldloca_S, rthVar));
+                il.InsertBefore(instr, il.Create(OpCodes.Initobj, rthVar.VariableType));
+                il.Replace(instr, il.Create(OpCodes.Ldloc, rthVar));
+            }
+            else
+            {
+                // Fallback for method/field tokens: just nop it if we can't easily zero it
+                il.Replace(instr, il.Create(OpCodes.Nop));
+            }
             _stackNeutralReplacements++;
             return;
         }
@@ -4693,12 +4952,29 @@ class DeweaverEngine
                 int pops = callMr.Parameters.Count + (callMr.HasThis ? 1 : 0);
                 bool hasReturn = callMr.ReturnType.MetadataType != MetadataType.Void;
 
-                // Build replacement: pop × pops + (ldnull if hasReturn)
+                // Build replacement: pop × pops + (default return if hasReturn)
                 var replacements = new List<Instruction>();
                 for (int i = 0; i < pops; i++)
                     replacements.Add(il.Create(OpCodes.Pop));
+                
                 if (hasReturn)
-                    replacements.Add(il.Create(OpCodes.Ldnull));
+                {
+                    // Bug AA: Use default value push for ValueTypes, ldnull only for Classes
+                    var retType = callMr.ReturnType;
+                    if (retType.IsValueType)
+                    {
+                        var tmp = new VariableDefinition(_module.ImportReference(retType));
+                        il.Body.Variables.Add(tmp);
+                        il.Body.InitLocals = true;
+                        replacements.Add(il.Create(OpCodes.Ldloca_S, tmp));
+                        replacements.Add(il.Create(OpCodes.Initobj, tmp.VariableType));
+                        replacements.Add(il.Create(OpCodes.Ldloc, tmp));
+                    }
+                    else
+                    {
+                        replacements.Add(il.Create(OpCodes.Ldnull));
+                    }
+                }
 
                 // Insert replacements before the instruction, then remove original
                 foreach (var rep in replacements)
@@ -4985,14 +5261,17 @@ class DeweaverEngine
         {
             if (type.Namespace == "Fusion.CodeGen") continue;
             if (type.Name == "<PrivateImplementationDetails>") continue;
+            // CRITICAL: Never modify compiler-generated types (async state machines, iterators, lambdas).
+            // These are generated by the C# compiler and have complex IL that our stack simulation
+            // cannot handle correctly. Modifying them causes "Unexpected return in MoveNext()",
+            // "Stack underflow", "Invalid branch target" errors in the decompiler output.
+            if (IsCompilerGeneratedType(type)) continue;
 
             foreach (var method in type.Methods.Where(m => m.Body != null).ToList())
             {
                 try
                 {
-                    _currentMethod = method;
-
-                    // CRITICAL: Only apply IL transformations to methods that were
+                    // CRITICAL: Only apply IL-transforming patterns to methods that were
                     // actually modified by the deweaver. Applying RevertBitCounterLogic
                     // or CleanupDeadCodePatterns to unmodified methods (e.g., obfuscated
                     // methods in emotitron.Compression.BitCounter) corrupts their IL
@@ -5007,46 +5286,51 @@ class DeweaverEngine
                         deadCodeCleaned += RevertBitCounterLogic(method);
                     }
 
-                    // Second pass: validate stack balance
+                    // CRITICAL FIX: Only patch stack underflows in methods that were actually
+                    // modified by the deweaver. Non-modified methods have valid IL from the
+                    // original assembly. Our stack simulator can falsely flag valid IL patterns
+                    // (complex control flow, exception handlers) as underflows, and replacing
+                    // valid instructions with pop/ldnull CORRUPTS the method.
                     if (!ValidateMethodBodyStackBalance(method))
                     {
                         if (isModified)
                         {
-                            // v8: NEVER stub deweaver-modified methods. Instead, attempt to fix.
-                            // With correct ECMA-335 stack deltas, most "imbalances" are false positives
-                            // or can be fixed by dead code cleanup.
-                            int extraClean = AggressiveStackCleanup(method);
-                            deadCodeCleaned += extraClean;
+                            // Attempt multi-pass fix: cleanup → patch → validate → repeat
+                            int totalFixed = 0;
+                            bool balanced = false;
 
-                            if (!ValidateMethodBodyStackBalance(method))
+                            for (int pass = 0; pass < 3 && !balanced; pass++)
                             {
-                                // Still broken after cleanup — try patching underflows
-                                int patched = PatchStackUnderflows(method);
-                                if (patched > 0)
+                                int extraClean = AggressiveStackCleanup(method);
+                                deadCodeCleaned += extraClean;
+
+                                if (!ValidateMethodBodyStackBalance(method))
                                 {
-                                    Console.WriteLine($"  INFO: Patched {patched} stack underflow(s) in {type.Name}::{method.Name}");
-                                    fixedBodies++;
+                                    int patched = PatchStackUnderflows(method);
+                                    if (patched > 0)
+                                        totalFixed += patched;
                                 }
+
+                                balanced = ValidateMethodBodyStackBalance(method);
+                            }
+
+                            if (totalFixed > 0)
+                            {
+                                fixedBodies++;
+                                if (balanced)
+                                    Console.WriteLine($"  INFO: Fixed {totalFixed} stack underflow(s) in {type.Name}::{method.Name}");
                                 else
-                                {
-                                    Console.WriteLine($"  NOTE: Stack anomaly in {type.Name}::{method.Name} (deweaver-modified, could not auto-fix)");
-                                    warningsOnly++;
-                                }
+                                    Console.WriteLine($"  INFO: Patched {totalFixed} stack underflow(s) in {type.Name}::{method.Name} (residual imbalance)");
                             }
                             else
                             {
-                                Console.WriteLine($"  INFO: Fixed stack balance in {type.Name}::{method.Name} via cleanup");
-                                fixedBodies++;
+                                Console.WriteLine($"  NOTE: Stack anomaly in {type.Name}::{method.Name} (deweaver-modified, could not auto-fix)");
+                                warningsOnly++;
                             }
                         }
-                        else
-                        {
-                            // Method we didn't touch — just warn, don't destroy it
-                            // The original IL might use patterns our validator doesn't handle
-                            // (unsafe code, pointer arithmetic, obfuscated IL, etc.)
-                            Console.WriteLine($"  NOTE: Stack balance anomaly in {type.Name}::{method.Name} (not deweaver-modified, leaving as-is)");
-                            warningsOnly++;
-                        }
+                        // Non-modified methods with stack issues are left as-is.
+                        // Their IL is valid in the original assembly — our simulator just can't
+                        // handle their complex control flow correctly.
                     }
                     validated++;
                 }
@@ -5062,94 +5346,20 @@ class DeweaverEngine
     }
 
     /// <summary>
-    /// Check if a method was modified by the deweaver by looking for known patterns:
-    /// - Instructions that reference fields/properties we changed (NetworkString → string)
-    /// - Instructions that reference removed types (Fusion.CodeGen, FixedStorage, etc.)
-    /// - Methods in types we explicitly processed (NetworkBehaviour, struct weaving)
+    /// Check if a method was actually modified by the deweaver.
+    /// Uses precise per-method tracking via MarkMethodModified() calls
+    /// at each deweaver step that modifies method bodies.
     /// </summary>
     private bool WasMethodModifiedByDeweaver(MethodDefinition method)
     {
         if (method.Body == null) return false;
 
-        // Check if the declaring type was a NetworkBehaviour we processed
-        var type = method.DeclaringType;
-        if (_processedNetworkBehaviours.Contains(type.FullName))
-            return true;
+        // Compiler-generated methods (in state machines, lambdas) are NEVER modified by the deweaver
+        if (IsCompilerGeneratedType(method.DeclaringType)) return false;
 
-        // v8: Only include emotitron.Compression/GorillaTag/Extensions if the type was
-        // actually processed by the deweaver (e.g., has weaved NetworkBehaviours or structs).
-        // Blanket-matching these namespaces was causing false positives that led to
-        // RevertBitCounterLogic and PatchStackUnderflows corrupting non-woven methods
-        // (e.g., emotitron.Compression.BitCounter.UsedBitCount uses ldarga/dup/ldind
-        // patterns that falsely match the deweaver's pointer-math reversion).
-        //
-        // Instead, only match these namespaces if the type was explicitly processed.
-        if (type.Namespace != null && (type.Namespace.Contains("emotitron.Compression") || 
-                                       type.Namespace.Contains("GorillaTag") ||
-                                       type.Name.Contains("Extensions")))
-        {
-            if (_processedNetworkBehaviours.Contains(type.FullName))
-                return true;
-
-            // Also check if this specific method references Fusion types (true sign of weaving)
-            foreach (var instr in method.Body.Instructions)
-            {
-                if (instr.Operand is TypeReference tr)
-                {
-                    if (tr.Namespace == "Fusion.CodeGen" ||
-                        tr.Name.Contains("FixedStorage") ||
-                        tr.Name.Contains("NetworkString`1"))
-                        return true;
-                }
-                if (instr.Operand is MethodReference mr && mr.DeclaringType != null)
-                {
-                    if (mr.DeclaringType.Namespace == "Fusion.CodeGen" ||
-                        mr.DeclaringType.Name?.Contains("FixedStorage") == true)
-                        return true;
-                }
-                if (instr.Operand is FieldReference fr && fr.FieldType != null)
-                {
-                    if (fr.FieldType.Namespace == "Fusion.CodeGen" ||
-                        fr.FieldType.Name?.Contains("NetworkString`1") == true)
-                        return true;
-                }
-            }
-
-            return false;
-        }
-
-        // Check if any instruction references Fusion.CodeGen or removed types
-        foreach (var instr in method.Body.Instructions)
-        {
-            if (instr.Operand is TypeReference tr)
-            {
-                if (tr.Namespace == "Fusion.CodeGen")
-                    return true;
-                if (tr.Name.Contains("FixedStorage") || tr.Name.Contains("NetworkString`1"))
-                    return true;
-            }
-            if (instr.Operand is MethodReference mr)
-            {
-                if (mr.DeclaringType?.Namespace == "Fusion.CodeGen")
-                    return true;
-                if (mr.DeclaringType?.Name?.Contains("FixedStorage") == true)
-                    return true;
-            }
-            if (instr.Operand is FieldReference fr)
-            {
-                if (fr.FieldType?.Namespace == "Fusion.CodeGen")
-                    return true;
-                if (fr.FieldType?.Name?.Contains("NetworkString`1") == true)
-                    return true;
-            }
-            
-            // NOTE: The "Dup followed by Ldind" fingerprint check was removed here because
-            // it caused false positives on non-woven methods (e.g., BitCounter.UsedBitCount
-            // in emotitron.Compression uses dup+ldind as part of its bit-spread algorithm).
-            // This pattern alone is not sufficient to identify Fusion-woven code.
-        }
-
-        return false;
+        // Only return true if this specific method was explicitly recorded as modified
+        string key = $"{method.DeclaringType.FullName}::{method.Name}";
+        return _modifiedMethods.Contains(key);
     }
 
     /// <summary>
@@ -5481,10 +5691,15 @@ class DeweaverEngine
 
                 var (pops, pushes) = GetInstructionStackDelta(push);
                 // Only remove pure pushes (pop 0, push 1, no side effects like calls or stores)
+                // Exclude address-taking opcodes — they appear in multi-instruction patterns
+                // (e.g., Ldflda + Ldind_I4) that don't follow the simple push/pop form.
                 if (pushes == 1 && pops == 0 &&
                     push.OpCode != OpCodes.Call && push.OpCode != OpCodes.Callvirt &&
                     push.OpCode != OpCodes.Newobj && push.OpCode != OpCodes.Ldftn &&
-                    push.OpCode != OpCodes.Ldvirtftn && push.OpCode != OpCodes.Dup)
+                    push.OpCode != OpCodes.Ldvirtftn && push.OpCode != OpCodes.Dup &&
+                    push.OpCode != OpCodes.Ldloca && push.OpCode != OpCodes.Ldloca_S &&
+                    push.OpCode != OpCodes.Ldflda && push.OpCode != OpCodes.Ldsflda &&
+                    push.OpCode != OpCodes.Ldarga && push.OpCode != OpCodes.Ldarga_S)
                 {
                     try
                     {
@@ -5502,12 +5717,20 @@ class DeweaverEngine
             // If an instruction pushes a value (Ldarg_0, Ldloc, or Ldarg) and is followed by another push 
             // or a terminator (Ret, Br, Leave, Throw) without a consuming instruction (like Stfld, Stloc, or Call) 
             // appearing in the next 5 instructions, the first push is "litter" and must be removed.
+            // NOTE: This scan checks only opcode membership, not variable identity — it does not access
+            // Instruction.Operand, so macro opcodes (Ldloc_0/1/2/3) with null Operand are safe here.
+            // If this logic is ever extended to track which specific local is the litter source,
+            // use ResolveLocVariable() to handle the null-operand case (see EnhancedDeadCodeCleanup).
             for (int i = 0; i < instructions.Count - 1; i++)
             {
                 var instr1 = instructions[i];
                 var instr2 = instructions[i + 1];
 
-                bool isPush1 = instr1.OpCode == OpCodes.Ldarg_0 || instr1.OpCode == OpCodes.Ldarg || 
+                bool isPush1 = instr1.OpCode == OpCodes.Ldarg_0 || instr1.OpCode == OpCodes.Ldarg_1 ||
+                               instr1.OpCode == OpCodes.Ldarg_2 || instr1.OpCode == OpCodes.Ldarg_3 ||
+                               instr1.OpCode == OpCodes.Ldarg || instr1.OpCode == OpCodes.Ldarg_S ||
+                               instr1.OpCode == OpCodes.Ldloc_0 || instr1.OpCode == OpCodes.Ldloc_1 ||
+                               instr1.OpCode == OpCodes.Ldloc_2 || instr1.OpCode == OpCodes.Ldloc_3 ||
                                instr1.OpCode == OpCodes.Ldloc || instr1.OpCode == OpCodes.Ldloc_S;
                 
                 var (p2, u2) = GetInstructionStackDelta(instr2);
@@ -5633,15 +5856,29 @@ class DeweaverEngine
                 else if (instr0.OpCode == OpCodes.Ldarga || instr0.OpCode == OpCodes.Ldarga_S)
                 {
                     var arg = instr0.Operand;
-                    instr0.OpCode = (arg is ParameterDefinition p && p.Index <= 3) ? GetLdargMacro(p.Index) : OpCodes.Ldarg_S;
-                    instrSt.OpCode = OpCodes.Starg_S;
+                    // Ldarg_S/Starg_S encode operand as byte (0-255); use full Ldarg/Starg for index > 255
+                    if (arg is ParameterDefinition p && p.Index <= 3)
+                        instr0.OpCode = GetLdargMacro(p.Index);
+                    else if (arg is ParameterDefinition p2 && p2.Index <= 255)
+                        instr0.OpCode = OpCodes.Ldarg_S;
+                    else
+                        instr0.OpCode = OpCodes.Ldarg;
+
+                    instrSt.OpCode = (arg is ParameterDefinition p3 && p3.Index > 255) ? OpCodes.Starg : OpCodes.Starg_S;
                     instrSt.Operand = arg;
                 }
                 else if (instr0.OpCode == OpCodes.Ldloca || instr0.OpCode == OpCodes.Ldloca_S)
                 {
                     var loc = instr0.Operand;
-                    instr0.OpCode = (loc is VariableDefinition v && v.Index <= 3) ? GetLdlocMacro(v.Index) : OpCodes.Ldloc_S;
-                    instrSt.OpCode = OpCodes.Stloc_S;
+                    // Ldloc_S/Stloc_S encode operand as byte (0-255); use full Ldloc/Stloc for index > 255
+                    if (loc is VariableDefinition v && v.Index <= 3)
+                        instr0.OpCode = GetLdlocMacro(v.Index);
+                    else if (loc is VariableDefinition v2 && v2.Index <= 255)
+                        instr0.OpCode = OpCodes.Ldloc_S;
+                    else
+                        instr0.OpCode = OpCodes.Ldloc;
+
+                    instrSt.OpCode = (loc is VariableDefinition v3 && v3.Index > 255) ? OpCodes.Stloc : OpCodes.Stloc_S;
                     instrSt.Operand = loc;
                 }
 
@@ -5675,14 +5912,24 @@ class DeweaverEngine
                     else if (instr0.OpCode == OpCodes.Ldarga || instr0.OpCode == OpCodes.Ldarga_S)
                     {
                         var arg = instr0.Operand;
-                        instr0.OpCode = (arg is ParameterDefinition p && p.Index <= 3) ? GetLdargMacro(p.Index) : OpCodes.Ldarg_S;
+                        if (arg is ParameterDefinition p && p.Index <= 3)
+                            instr0.OpCode = GetLdargMacro(p.Index);
+                        else if (arg is ParameterDefinition p2 && p2.Index <= 255)
+                            instr0.OpCode = OpCodes.Ldarg_S;
+                        else
+                            instr0.OpCode = OpCodes.Ldarg;
                         il.Remove(instr1);
                         revertedCount++;
                     }
                     else if (instr0.OpCode == OpCodes.Ldloca || instr0.OpCode == OpCodes.Ldloca_S)
                     {
                         var loc = instr0.Operand;
-                        instr0.OpCode = (loc is VariableDefinition v && v.Index <= 3) ? GetLdlocMacro(v.Index) : OpCodes.Ldloc_S;
+                        if (loc is VariableDefinition v && v.Index <= 3)
+                            instr0.OpCode = GetLdlocMacro(v.Index);
+                        else if (loc is VariableDefinition v2 && v2.Index <= 255)
+                            instr0.OpCode = OpCodes.Ldloc_S;
+                        else
+                            instr0.OpCode = OpCodes.Ldloc;
                         il.Remove(instr1);
                         revertedCount++;
                     }
@@ -5698,8 +5945,38 @@ class DeweaverEngine
     private static OpCode GetLdlocMacro(int index) => index switch { 0 => OpCodes.Ldloc_0, 1 => OpCodes.Ldloc_1, 2 => OpCodes.Ldloc_2, 3 => OpCodes.Ldloc_3, _ => OpCodes.Ldloc_S };
 
     /// <summary>
+    /// Resolve the VariableDefinition targeted by a local-variable instruction.
+    /// Macro opcodes (Stloc_0/1/2/3, Ldloc_0/1/2/3) encode the index in the opcode
+    /// itself and have Operand == null in Cecil — so casting Operand to VariableDefinition
+    /// always returns null. This helper resolves the variable from the body's variable list
+    /// by index for macro forms. Short-form and full-form opcodes (Stloc_S, Ldloc_S, Stloc,
+    /// Ldloc, Ldloca, Ldloca_S) store the VariableDefinition in Operand and are handled by
+    /// the fallback branch.
+    /// </summary>
+    private static VariableDefinition? ResolveLocVariable(Instruction instr, MethodBody body)
+    {
+        int idx = instr.OpCode.Code switch
+        {
+            Code.Stloc_0 => 0, Code.Stloc_1 => 1, Code.Stloc_2 => 2, Code.Stloc_3 => 3,
+            Code.Ldloc_0 => 0, Code.Ldloc_1 => 1, Code.Ldloc_2 => 2, Code.Ldloc_3 => 3,
+            _ => -1
+        };
+        if (idx >= 0)
+            return idx < body.Variables.Count ? body.Variables[idx] : null;
+        return instr.Operand as VariableDefinition;
+    }
+
+    /// <summary>
     /// Attempt to patch stack underflows by replacing instructions that
     /// would pop more values than available with stack-neutral alternatives.
+    ///
+    /// Two-pass approach: first run BFS to collect all underflowing instructions,
+    /// then apply replacements in a second pass. This avoids mutating instructions
+    /// while stale references to them may still exist in the BFS work queue.
+    /// When ReplaceInstructionWithStackNeutral replaces an instruction, Cecil creates
+    /// a new Instruction object at the same position, detaching the old one from the
+    /// linked list — causing instr.Next to return null and silently cutting off BFS
+    /// exploration of the successor path.
     /// </summary>
     private int PatchStackUnderflows(MethodDefinition method)
     {
@@ -5724,7 +6001,8 @@ class DeweaverEngine
             if (eh.FilterStart != null) workList.Enqueue((eh.FilterStart, 1));
         }
 
-        int patched = 0;
+        // Pass 1: BFS to find all underflowing instructions (no mutation)
+        var underflows = new HashSet<Instruction>();
         int maxIterations = instructions.Count * 10;
 
         while (workList.Count > 0 && maxIterations-- > 0)
@@ -5733,7 +6011,9 @@ class DeweaverEngine
 
             if (stackDepths.TryGetValue(instr, out int existingDepth))
             {
-                if (currentDepth <= existingDepth) continue;
+                // Track MINIMUM depth to expose worst-case underflows on low paths.
+                // If we already visited this instruction with a lower/equal depth, skip.
+                if (currentDepth >= existingDepth) continue;
             }
             stackDepths[instr] = currentDepth;
 
@@ -5741,12 +6021,7 @@ class DeweaverEngine
 
             if (currentDepth < pops)
             {
-                try
-                {
-                    ReplaceInstructionWithStackNeutral(il, instr, false);
-                    patched++;
-                }
-                catch { }
+                underflows.Add(instr);
                 continue;
             }
 
@@ -5791,6 +6066,18 @@ class DeweaverEngine
 
             if (instr.Next != null)
                 workList.Enqueue((instr.Next, newDepth));
+        }
+
+        // Pass 2: Replace all underflowing instructions (after BFS is complete)
+        int patched = 0;
+        foreach (var instr in underflows)
+        {
+            try
+            {
+                ReplaceInstructionWithStackNeutral(il, instr, false);
+                patched++;
+            }
+            catch { }
         }
 
         return patched;
@@ -5970,18 +6257,25 @@ class DeweaverEngine
     #region Step 15: Ensure All Struct Backing Fields Are Initialized
 
     /// <summary>
-    /// C# structs with auto-properties must have all fields assigned in constructors
-    /// (CS0843/CS8079). After creating backing fields for Networked properties on structs,
-    /// we need to:
-    /// - Find or create a parameterless constructor
-    /// - Add initialization for any unassigned backing fields in the constructor
-    /// - For value types: initobj or default initialization
-    /// - For reference types: null initialization
+    /// Ensure backing fields for [Networked] struct properties exist and sanitize constructors.
+    ///
+    /// CRITICAL FIX FOR CS0188 / CS0171:
+    /// C# strictly requires all struct fields to be assigned before 'this' is used or control returns.
+    /// When we generate new &lt;PropName&gt;k__BackingField elements, existing custom constructors
+    /// fail this compiler check in the decompiled source.
+    ///
+    /// We solve this globally by injecting `this = default;` (IL: ldarg.0, initobj [Type])
+    /// at the very top of every parameterized struct constructor that owns networked backing fields.
+    /// This satisfies definitive assignment rules for all C# versions without any manual source edits.
+    ///
+    /// Parameterless struct constructors are intentionally skipped — Step 16 removes them entirely
+    /// (CS8773 fix for C# 9.0 compatibility), so patching them would be wasted work.
     /// </summary>
     private void Step15_EnsureStructBackingFieldInit()
     {
-        Console.WriteLine("[Step 15] Ensuring all struct backing fields are initialized...");
-        int created = 0;
+        Console.WriteLine("[Step 15] Ensuring struct backing fields exist and sanitizing constructors...");
+        int backingFieldCount = 0;
+        int ctorsFixed = 0;
 
         foreach (var type in GetAllTypes())
         {
@@ -5996,109 +6290,56 @@ class DeweaverEngine
                 .Where(f => !f.IsStatic)
                 .ToList();
 
-            if (backingFields.Count == 0) continue;
+            backingFieldCount += backingFields.Count;
 
-            // Check which fields are already assigned in constructors
-            var backingFieldNames = new HashSet<string>(backingFields.Select(f => f.Name));
-            var assignedFields = new HashSet<string>();
-            foreach (var ctor in type.Methods.Where(m => m.IsConstructor && !m.IsStatic && m.Body != null))
+            // Inject `this = default;` at the start of all PARAMETERIZED constructors for structs
+            // that have networked backing fields, to prevent CS0188 and CS0171.
+            // Parameterless ctors are skipped here because Step 16 removes them entirely.
+            if (backingFields.Count > 0)
             {
-                foreach (var instr in ctor.Body.Instructions)
+                var ctors = type.Methods
+                    .Where(m => m.IsConstructor && !m.IsStatic && m.Parameters.Count > 0 && m.Body != null)
+                    .ToList();
+
+                foreach (var ctor in ctors)
                 {
-                    if ((instr.OpCode == OpCodes.Stfld || instr.OpCode == OpCodes.Ldflda || instr.OpCode == OpCodes.Ldfld) &&
-                        instr.Operand is FieldReference fr && backingFieldNames.Contains(fr.Name))
+                    var instructions = ctor.Body.Instructions;
+                    if (instructions.Count == 0) continue;
+
+                    // Skip if the zeroing pattern (ldarg.0 + initobj) is already present
+                    if (instructions.Count >= 2 &&
+                        instructions[0].OpCode == OpCodes.Ldarg_0 &&
+                        instructions[1].OpCode == OpCodes.Initobj)
+                        continue;
+
+                    var il = ctor.Body.GetILProcessor();
+                    var ldarg0  = il.Create(OpCodes.Ldarg_0);
+                    
+                    // Bug L: For generic structs, we must use a GenericInstanceType reference for initobj
+                    TypeReference typeRef = type;
+                    if (type.HasGenericParameters)
                     {
-                        assignedFields.Add(fr.Name);
+                        var git = new GenericInstanceType(type);
+                        foreach (var gp in type.GenericParameters)
+                            git.GenericArguments.Add(gp);
+                        typeRef = git;
                     }
+                    
+                    var initobj = il.Create(OpCodes.Initobj, _module.ImportReference(typeRef));
+
+                    il.InsertBefore(instructions[0], ldarg0);
+                    il.InsertAfter(ldarg0, initobj);
+
+                    MarkMethodModified(ctor);
+                    ctorsFixed++;
+                    Console.WriteLine($"    Injected 'this=default' into ctor: {type.Name}({string.Join(", ", ctor.Parameters.Select(p => p.ParameterType.Name))})");
                 }
-            }
-
-            // Find unassigned backing fields
-            var unassigned = backingFields.Where(f => !assignedFields.Contains(f.Name)).ToList();
-            if (unassigned.Count == 0) continue;
-
-            // Find or create a parameterless constructor
-            var paramlessCtor = type.Methods.FirstOrDefault(m =>
-                m.IsConstructor && !m.IsStatic && m.Parameters.Count == 0);
-
-            if (paramlessCtor == null)
-            {
-                // Create a new parameterless constructor
-                var methodAttributes = MethodAttributes.Public | MethodAttributes.HideBySig |
-                                       MethodAttributes.SpecialName | MethodAttributes.RTSpecialName;
-                paramlessCtor = new MethodDefinition(".ctor", methodAttributes, _module.TypeSystem.Void);
-                type.Methods.Add(paramlessCtor);
-
-                var il = paramlessCtor.Body.GetILProcessor();
-                // For structs, we cannot use initobj on 'this' inside a ctor (invalid IL).
-                // Instead, we just return immediately — the CLR zeros all struct fields by default.
-                // Individual field initializations will be added below for unassigned backing fields.
-                il.Emit(OpCodes.Ret);
-                paramlessCtor.Body.InitLocals = true;
-                Console.WriteLine($"  Created parameterless constructor for {type.Name}");
-            }
-
-            // Add field initializations before the Ret instruction
-            if (paramlessCtor.Body != null)
-            {
-                var il = paramlessCtor.Body.GetILProcessor();
-                var lastInstr = paramlessCtor.Body.Instructions.LastOrDefault();
-
-                // Insert before the final Ret
-                var insertBefore = lastInstr?.OpCode == OpCodes.Ret ? lastInstr : null;
-
-                foreach (var field in unassigned)
-                {
-                    var fieldRef = _module.ImportReference(field);
-
-                    if (field.FieldType.IsValueType)
-                    {
-                        // Init the field: this.field = default(FieldType);
-                        // Use initobj pattern
-                        var initInstrs = new List<Instruction>();
-                        initInstrs.Add(il.Create(OpCodes.Ldarg_0));
-                        initInstrs.Add(il.Create(OpCodes.Ldflda, fieldRef));
-                        initInstrs.Add(il.Create(OpCodes.Initobj, _module.ImportReference(field.FieldType)));
-
-                        if (insertBefore != null)
-                        {
-                            foreach (var i in initInstrs)
-                                il.InsertBefore(insertBefore, i);
-                        }
-                        else
-                        {
-                            foreach (var i in initInstrs)
-                                il.Append(i);
-                        }
-                    }
-                    else
-                    {
-                        // Reference type: this.field = null;
-                        var initInstrs = new List<Instruction>();
-                        initInstrs.Add(il.Create(OpCodes.Ldarg_0));
-                        initInstrs.Add(il.Create(OpCodes.Ldnull));
-                        initInstrs.Add(il.Create(OpCodes.Stfld, fieldRef));
-
-                        if (insertBefore != null)
-                        {
-                            foreach (var i in initInstrs)
-                                il.InsertBefore(insertBefore, i);
-                        }
-                        else
-                        {
-                            foreach (var i in initInstrs)
-                                il.Append(i);
-                        }
-                    }
-                }
-
-                created += unassigned.Count;
-                Console.WriteLine($"  Added {unassigned.Count} field initializations for {type.Name}");
             }
         }
 
-        _structBackingFieldInits = created;
-        Console.WriteLine($"  Struct backing field initializations created: {created}");
+        _structBackingFieldInits = backingFieldCount;
+        Console.WriteLine($"  Struct backing fields verified: {backingFieldCount}");
+        Console.WriteLine($"  Struct constructors padded with 'this=default' (CS0188/CS0171 fix): {ctorsFixed}");
     }
 
     #endregion
@@ -6106,29 +6347,30 @@ class DeweaverEngine
     #region Step 16: Parameterless Constructor Sanitization
 
     /// <summary>
-    /// Remove trivial parameterless constructors that only call base..ctor() and return.
+    /// Remove trivial parameterless constructors for clean C# 9.0 decompilation.
     ///
-    /// Standard C# NetworkBehaviour classes often don't have a visible constructor.
-    /// The weaver always ensures one exists to call InitMeta. If the recovered .ctor is just:
-    ///   ldarg.0
-    ///   call      base..ctor()
-    ///   ret
-    /// and the class didn't have one before weaving, we can remove it to make the
-    /// decompilation even cleaner (making it an implicit default constructor).
+    /// Two sub-tasks:
+    /// 1. STRUCTS: Remove ALL parameterless struct constructors (CS8773 fix).
+    ///    C# 9.0 does not support explicit parameterless struct constructors.
+    ///    The CLR implicitly zero-initializes all struct fields, so these constructors
+    ///    (typically added by the Fusion weaver or previous deweaver versions) are
+    ///    unnecessary and cause compilation errors in C# 9.0.
     ///
-    /// We only remove constructors for REFERENCE types (classes), not structs.
-    /// Structs always need their parameterless constructor explicitly.
+    /// 2. CLASSES: Remove trivial parameterless constructors from NetworkBehaviours
+    ///    that only call base..ctor() and return. Standard C# NetworkBehaviour classes
+    ///    often don't have a visible constructor — the weaver adds one to call InitMeta.
+    ///    If the recovered .ctor is just: ldarg.0 / call base..ctor() / ret, we remove
+    ///    it for an implicit default constructor.
     /// </summary>
     private void Step16_SanitizeTrivialConstructors()
     {
-        Console.WriteLine("[Step 16] Sanitizing trivial parameterless constructors...");
-        int removed = 0;
+        Console.WriteLine("[Step 16] Sanitizing parameterless constructors (C# 9.0 compatibility)...");
+        int removedStructCtors = 0;
+        int removedClassCtors = 0;
 
         foreach (var type in GetAllTypes())
         {
             if (type.Namespace == "Fusion.CodeGen") continue;
-            if (type.IsValueType) continue; // Don't remove struct constructors
-            if (!IsNetworkBehaviour(type)) continue;
 
             var ctors = type.Methods
                 .Where(m => m.IsConstructor && !m.IsStatic && m.Parameters.Count == 0 && m.Body != null)
@@ -6136,6 +6378,23 @@ class DeweaverEngine
 
             foreach (var ctor in ctors)
             {
+                if (type.IsValueType)
+                {
+                    // STRUCTS: Remove ALL parameterless constructors for C# 9.0 compatibility.
+                    // C# 9.0 does not support explicit parameterless struct constructors (CS8773).
+                    // The CLR zero-initializes all struct fields by default.
+                    // These constructors are typically added by the Fusion weaver to initialize
+                    // backing fields, but that initialization is redundant with CLR zeroing.
+                    type.Methods.Remove(ctor);
+                    removedStructCtors++;
+                    _sanitizedTrivialCtors++;
+                    Console.WriteLine($"  Removed parameterless struct ctor (CS8773): {type.Name}");
+                    continue;
+                }
+
+                // CLASSES: Only process NetworkBehaviours
+                if (!IsNetworkBehaviour(type)) continue;
+
                 var instructions = ctor.Body.Instructions;
 
                 // Check if this constructor is trivial: ldarg.0, call base..ctor(), ret
@@ -6154,14 +6413,15 @@ class DeweaverEngine
                 {
                     // This is a trivial constructor - remove it
                     type.Methods.Remove(ctor);
-                    removed++;
+                    removedClassCtors++;
                     _sanitizedTrivialCtors++;
-                    Console.WriteLine($"  Removed trivial parameterless constructor from {type.Name}");
+                    Console.WriteLine($"  Removed trivial class ctor: {type.Name}");
                 }
             }
         }
 
-        Console.WriteLine($"  Trivial constructors removed: {removed}");
+        Console.WriteLine($"  Struct parameterless ctors removed (CS8773): {removedStructCtors}");
+        Console.WriteLine($"  Trivial class ctors removed: {removedClassCtors}");
     }
 
     #endregion
@@ -6184,6 +6444,16 @@ class DeweaverEngine
     /// - Instructions that reference constructors (like base..ctor()) from external
     ///   types that weren't explicitly imported when the containing method was modified
     /// </summary>
+    private void Step16b_FixGlobalILArtifacts()
+    {
+        Console.WriteLine("[Step 16b] Fixing global IL artifacts (op_Implicit, Ldftn)...");
+        foreach (var type in GetAllTypes())
+        {
+            if (type.Namespace == "Fusion.CodeGen") continue;
+            FixGlobalILArtifacts(type);
+        }
+    }
+
     private void Step17_SanitizeCrossModuleReferences()
     {
         Console.WriteLine("[Step 17] Sanitizing cross-module instruction references...");
@@ -6796,6 +7066,155 @@ class DeweaverEngine
 
     #region Helpers
 
+    /// <summary>
+    /// Preserve all original TypeReferences in the output assembly.
+    /// 
+    /// ROOT CAUSE: Mono.Cecil's writer only includes TypeReferences that are reachable
+    /// from the assembly's code and metadata. When the deweaver removes custom attributes
+    /// or code that was the sole reference to a type, Cecil drops that TypeReference from
+    /// the metadata TypeRef table. ICSharpCode.Decompiler v10 then fails to resolve types
+    /// whose TypeRef entries are missing, producing "Unknown result type (might be due to
+    /// invalid IL or missing references)" comments in the decompiled C# output.
+    ///
+    /// Fix: We create a hidden type (inside &lt;PrivateImplementationDetails&gt;) with static
+    /// fields of each missing TypeReference. Cecil includes TypeReferences used as field
+    /// types. The decompiler skips types starting with '&lt;', so the dummy type is invisible
+    /// in the decompiled output.
+    ///
+    /// We skip Fusion-specific types (CodeGen, weaver markers) since those are
+    /// intentionally removed by the deweaver.
+    /// </summary>
+    private void PreserveOriginalTypeReferences()
+    {
+        if (_originalTypeRefNames == null || _originalTypeRefNames.Count == 0)
+            return;
+
+        var currentTypeRefs = new HashSet<string>(
+            _module.GetTypeReferences().Select(tr => tr.FullName));
+
+        var missing = _originalTypeRefNames
+            .Except(currentTypeRefs)
+            .Where(name => !ShouldSkipTypeRefPreservation(name))
+            .ToList();
+
+        if (missing.Count == 0)
+        {
+            Console.WriteLine("[PreserveTypeRefs] All original TypeReferences present.");
+            return;
+        }
+
+        Console.WriteLine($"[PreserveTypeRefs] Restoring {missing.Count} removed TypeReferences...");
+
+        // Find or create <PrivateImplementationDetails> container
+        var container = _module.Types.FirstOrDefault(t => t.Name == "<PrivateImplementationDetails>");
+        if (container == null)
+        {
+            container = new TypeDefinition(
+                "", "<PrivateImplementationDetails>",
+                TypeAttributes.NotPublic | TypeAttributes.Sealed | TypeAttributes.Abstract,
+                _module.TypeSystem.Object);
+            _module.Types.Add(container);
+        }
+
+        // Create the hidden preservation type
+        var preserveType = new TypeDefinition(
+            "",
+            "<TypeRefPreservation>k__BackingField",
+            TypeAttributes.NestedPrivate | TypeAttributes.Sealed,
+            _module.TypeSystem.Object);
+        container.NestedTypes.Add(preserveType);
+
+        foreach (var fullName in missing)
+        {
+            try
+            {
+                var lastDot = fullName.LastIndexOf('.');
+                string ns = lastDot >= 0 ? fullName.Substring(0, lastDot) : "";
+                string name = lastDot >= 0 ? fullName.Substring(lastDot + 1) : fullName;
+
+                // Find scope from existing TypeRefs in the same namespace
+                AssemblyNameReference? scope = null;
+                foreach (var tr in _module.GetTypeReferences())
+                {
+                    if (tr.Namespace == ns && tr.Scope is AssemblyNameReference anr)
+                    {
+                        scope = anr;
+                        break;
+                    }
+                }
+
+                if (scope == null)
+                {
+                    // Fallback: match by prefix
+                    if (fullName.StartsWith("UnityEngine."))
+                        scope = _module.AssemblyReferences.FirstOrDefault(a => a.Name.StartsWith("UnityEngine."));
+                    else if (fullName.StartsWith("System.Runtime.CompilerServices."))
+                        scope = _module.AssemblyReferences.FirstOrDefault(a => a.Name == "netstandard");
+                    else if (fullName.StartsWith("Oculus."))
+                        scope = _module.AssemblyReferences.FirstOrDefault(a => a.Name.StartsWith("Oculus."));
+                    else if (fullName.StartsWith("Sirenix."))
+                        scope = _module.AssemblyReferences.FirstOrDefault(a => a.Name.Contains("Sirenix"));
+                    else if (fullName.StartsWith("Pathfinding."))
+                        scope = _module.AssemblyReferences.FirstOrDefault(a => a.Name.StartsWith("Astar"));
+                    else if (fullName.StartsWith("Photon."))
+                        scope = _module.AssemblyReferences.FirstOrDefault(a => a.Name.StartsWith("Photon"));
+                }
+
+                if (scope != null)
+                {
+                    var typeRef = new TypeReference(ns, name, _module, scope);
+                    var imported = _module.ImportReference(typeRef);
+                    var field = new FieldDefinition(
+                        $"__preserved_{name.Replace('`', '_').Replace('/', '_')}",
+                        FieldAttributes.Private | FieldAttributes.Static,
+                        imported);
+                    preserveType.Fields.Add(field);
+                }
+            }
+            catch { }
+        }
+
+        Console.WriteLine($"[PreserveTypeRefs] Done. {preserveType.Fields.Count} TypeRefs preserved.");
+    }
+
+    /// <summary>
+    /// Check if a TypeReference should NOT be preserved (Fusion types we intentionally remove).
+    /// </summary>
+    private static bool ShouldSkipTypeRefPreservation(string fullName)
+    {
+        if (fullName.StartsWith("Fusion.CodeGen")) return true;
+
+        // Fusion weaver-specific types that should be removed.
+        // Only include CodeGen-internal types and weaver marker attributes here.
+        // Do NOT include user-facing public API types (e.g., RpcChannel, RpcHostMode)
+        // — dropping their TypeRefs causes "Unknown result type" decompiler comments
+        // on every RPC method that references them.
+        return fullName switch
+        {
+            "Fusion.CompareOperator" => true,
+            "Fusion.DefaultForPropertyAttribute" => true,
+            "Fusion.DrawIfAttribute" => true,
+            "Fusion.DrawIfMode" => true,
+            "Fusion.FixedBufferPropertyAttribute" => true,
+            "Fusion.Native" => true,
+            "Fusion.NetworkAssemblyWeavedAttribute" => true,
+            "Fusion.NetworkBehaviourWeavedAttribute" => true,
+            "Fusion.NetworkedWeavedAttribute" => true,
+            "Fusion.NetworkInputWeavedAttribute" => true,
+            "Fusion.NetworkRpcStaticWeavedInvokerAttribute" => true,
+            "Fusion.NetworkRpcWeavedInvokerAttribute" => true,
+            "Fusion.NetworkStructWeavedAttribute" => true,
+            "Fusion.PreserveInPluginAttribute" => true,
+            "Fusion.ReadWriteUtilsForWeaver" => true,
+            "Fusion.WeaverGeneratedAttribute" => true,
+            _ when fullName.StartsWith("Fusion.IElementReaderWriter") => true,
+            _ when fullName.StartsWith("Fusion.Internal.Unity") => true,
+            _ when fullName.StartsWith("Fusion.SerializableDictionary") => true,
+            _ when fullName.StartsWith("Fusion.Simulation") => true,
+            _ => false,
+        };
+    }
+
     private IEnumerable<TypeDefinition> GetAllTypes()
     {
         // Materialize types eagerly to avoid deferred Cecil issues.
@@ -6833,6 +7252,21 @@ class DeweaverEngine
         }
     }
 
+    /// <summary>
+    /// Check if a type is compiler-generated (async state machines, iterators, lambdas).
+    /// These types have names like &lt;&gt;d__1, &lt;&gt;c__DisplayClass, &lt;MoveNext&gt;d__0, etc.
+    /// The deweaver should NEVER modify IL in these types as they are generated by the C# compiler.
+    /// </summary>
+    private bool IsCompilerGeneratedType(TypeDefinition type)
+    {
+        if (string.IsNullOrEmpty(type.Name)) return false;
+        // Compiler-generated types always start with '<'
+        if (type.Name.StartsWith("<")) return true;
+        // Also catch types like VB$StateMachine_1 (VB compiler state machines)
+        if (type.Name.StartsWith("VB$")) return true;
+        return false;
+    }
+
     private bool IsNetworkBehaviour(TypeDefinition type)
     {
         return IsSubclassOf(type, "NetworkBehaviour");
@@ -6859,6 +7293,50 @@ class DeweaverEngine
     private bool ImplementsInterface(TypeDefinition type, string ifaceName)
     {
         return type.Interfaces.Any(i => i.InterfaceType.Name == ifaceName);
+    }
+
+    /// <summary>
+    /// Check if a parameter type is compatible with a CustomAttributeArgument.
+    /// Used when matching proxy attribute constructors to real attribute constructors.
+    /// Handles enum types (match by underlying type), numeric widening, and exact matches.
+    /// </summary>
+    private bool IsTypeCompatible(TypeReference paramType, CustomAttributeArgument arg)
+    {
+        try
+        {
+            // Exact match (symmetric — handles both param==arg and arg==param)
+            if (paramType.FullName == arg.Type.FullName)
+                return true;
+
+            // Numeric widening: int→long, etc.
+            var paramMeta = paramType.MetadataType;
+            var argMeta = arg.Type.MetadataType;
+            if (paramMeta == argMeta)
+                return true;
+
+            // Allow int-based arguments for enum parameters
+            if (paramType.IsValueType && !paramType.IsPrimitive)
+            {
+                try
+                {
+                    var resolved = paramType.Resolve();
+                    if (resolved?.IsEnum == true && (argMeta == MetadataType.Int32 || argMeta == MetadataType.Int64))
+                        return true;
+                }
+                catch { }
+            }
+
+            return false;
+        }
+        catch
+        {
+            // If we can't determine compatibility, reject it (fail closed).
+            // Falling through to the parameterless-ctor fallback is safer than
+            // selecting a potentially incompatible constructor, which would produce
+            // a CustomAttribute with mismatched argument types that causes CLR
+            // loading failures at runtime.
+            return false;
+        }
     }
 
     private void RemoveCustomAttribute(ICustomAttributeProvider provider, string attrName, ref int counter)
@@ -6934,6 +7412,128 @@ class DeweaverEngine
     }
 
     /// <summary>
+    /// Remove [IsReadOnly] attribute from a property getter method.
+    ///
+    /// Fusion adds 'readonly get' modifiers to struct property getters. The decompiler
+    /// outputs these as "readonly get { ... }" which prevents auto-property folding
+    /// because auto-properties can't have 'readonly get' in C# 9.
+    ///
+    /// In Mono.Cecil 0.11.6, the readonly modifier is represented as a custom attribute
+    /// (System.Runtime.CompilerServices.IsReadOnlyAttribute) on the method.
+    /// </summary>
+    private void ClearReadOnlyGetterAttribute(MethodDefinition? method)
+    {
+        if (method == null) return;
+        try
+        {
+            method.CustomAttributes.RemoveWhere(a =>
+                a.AttributeType.FullName == "System.Runtime.CompilerServices.IsReadOnlyAttribute");
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// Ensure a backing field has all metadata required for ICSharpCode.Decompiler
+    /// auto-property recognition: [CompilerGenerated], [DebuggerBrowsable(Never)],
+    /// and FieldAttributes.SpecialName flag.
+    ///
+    /// Existing backing fields (from the original unwoven DLL) may be missing these
+    /// if Fusion stripped them during weaving. Without [CompilerGenerated] and
+    /// SpecialName, the decompiler won't fold the property into an auto-property.
+    /// </summary>
+    private void EnsureBackingFieldMetadata(FieldDefinition backingField)
+    {
+        // Ensure SpecialName flag (standard for auto-property backing fields)
+        if ((backingField.Attributes & FieldAttributes.SpecialName) == 0)
+        {
+            backingField.Attributes |= FieldAttributes.SpecialName;
+        }
+
+        // Ensure [CompilerGenerated] attribute
+        if (!backingField.CustomAttributes.Any(a => a.AttributeType.Name == "CompilerGeneratedAttribute"))
+        {
+            AddCompilerGeneratedAttribute(backingField);
+        }
+
+        // Ensure [DebuggerBrowsable(Never)] attribute
+        if (!backingField.CustomAttributes.Any(a => a.AttributeType.Name == "DebuggerBrowsableAttribute"))
+        {
+            AddDebuggerBrowsableNeverAttribute(backingField);
+        }
+    }
+
+    /// <summary>
+    /// Rename a field and update all references to it in the entire module.
+    /// This is used to normalize backing field names to standard C# auto-property names.
+    /// </summary>
+    private void RenameFieldAndFixReferences(TypeDefinition declaringType, FieldDefinition field, string newName)
+    {
+        string oldName = field.Name;
+        field.Name = newName;
+
+        // Update all instructions in all methods that might reference this field
+        foreach (var type in GetAllTypes())
+        {
+            foreach (var method in type.Methods)
+            {
+                if (method.Body == null) continue;
+                foreach (var instr in method.Body.Instructions)
+                {
+                    if (instr.Operand is FieldReference fr)
+                    {
+                        try
+                        {
+                            var resolved = fr.Resolve();
+                            if (resolved != null && ReferenceEquals(resolved, field))
+                            {
+                                // This reference points to our field. Update its name.
+                                fr.Name = newName;
+                            }
+                        }
+                        catch { }
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Create a simple setter method for a get-only property.
+    ///
+    /// Fusion sometimes removes the setter from [Networked] properties during weaving.
+    /// Without a setter, ICSharpCode.Decompiler can't fold the property into an
+    /// auto-property (e.g., "public string Name { get; set; }"). This method creates
+    /// a minimal setter: "this.&lt;Name&gt;k__BackingField = value;" with [CompilerGenerated].
+    /// </summary>
+    private void CreateSimpleSetter(PropertyDefinition prop, FieldDefinition backingField)
+    {
+        try
+        {
+            var setter = new MethodDefinition($"set_{prop.Name}",
+                MethodAttributes.Public | MethodAttributes.SpecialName | MethodAttributes.HideBySig,
+                _module.TypeSystem.Void);
+
+            setter.Parameters.Add(new ParameterDefinition("value", ParameterAttributes.None, prop.PropertyType));
+
+            var il = setter.Body.GetILProcessor();
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Ldarg_1);
+            il.Emit(OpCodes.Stfld, _module.ImportReference(backingField));
+            il.Emit(OpCodes.Ret);
+
+            EnsureCompilerGeneratedOnMethod(setter);
+            prop.SetMethod = setter;
+            prop.DeclaringType.Methods.Add(setter);
+            _createdSetters++;
+            Console.WriteLine($"    Created setter for get-only property: {prop.DeclaringType.Name}.{prop.Name}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"    WARNING: Failed to create setter for {prop.Name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
     /// Add [DebuggerBrowsable(DebuggerBrowsableState.Never)] attribute to a field,
     /// matching standard C# compiler output for backing fields.
     /// </summary>
@@ -6967,6 +7567,31 @@ class DeweaverEngine
 
     private TypeReference ImportType(string fullName)
     {
+        // First check CorLib (mscorlib / System.Private.CoreLib)
+        var corLib = _module.TypeSystem.CoreLibrary;
+        if (corLib != null)
+        {
+            try
+            {
+                var asm = (corLib is AssemblyNameReference anr) ? _resolver.Resolve(anr) : null;
+                if (asm != null)
+                {
+                    // Console.WriteLine($"      [DEBUG IMPORT] Searching in CorLib: {asm.FullName}");
+                    var type = asm.MainModule.GetType(fullName);
+                    if (type != null) return _module.ImportReference(type);
+                }
+                else
+                {
+                    Console.WriteLine($"      [DEBUG IMPORT] Could not resolve CorLib: {corLib.Name}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"      [DEBUG IMPORT] Exception resolving CorLib: {ex.Message}");
+            }
+        }
+
+        // Then check all assembly references
         foreach (var asmRef in _module.AssemblyReferences)
         {
             try
@@ -6978,6 +7603,20 @@ class DeweaverEngine
             }
             catch { }
         }
+
+        // FALLBACK: Exhaustive search in ALL resolved assemblies if still not found
+        // This is necessary because CompilerGeneratedAttribute might be in a facade or a reference
+        // that isn't directly listed in the module's immediate references.
+        try
+        {
+            foreach (var asm in _resolver.GetResolvedAssemblies())
+            {
+                var type = asm.MainModule.GetType(fullName);
+                if (type != null) return _module.ImportReference(type);
+            }
+        }
+        catch { }
+
         return _module.TypeSystem.Object;
     }
 
@@ -7027,7 +7666,7 @@ class DeweaverEngine
     private void PrintStatistics()
     {
         Console.WriteLine();
-        Console.WriteLine($"=== Deweaver Statistics (Diamond Edition v8 - Zero Stub - Fusion {(_isFusion2 ? "2.x" : "1.x")}) ===");
+        Console.WriteLine($"=== Deweaver Statistics (Diamond Edition v8.1 - Zero Stub + Final IL Cleanup - Fusion {(_isFusion2 ? "2.x" : "1.x")}) ===");
         Console.WriteLine($"  Assembly attributes removed:    {_removedAssemblyAttrs}");
         Console.WriteLine($"  RPC invoker methods removed:    {_removedInvokerMethods}");
         Console.WriteLine($"  RPC methods restored:           {_restoredRpcMethods}");
@@ -7085,15 +7724,758 @@ class DeweaverEngine
         Console.WriteLine($"  Field [Accuracy] attrs migrated:{_migratedFieldAccuracyAttrs}");
         Console.WriteLine($"  Field [Capacity] attrs migrated:{_migratedFieldCapacityAttrs}");
         Console.WriteLine($"  Accessor [CompilerGenerated] added:{_accessorCompilerGeneratedAttrs}");
+        Console.WriteLine($"  Setters created (get-only props): {_createdSetters}");
         Console.WriteLine($"  Orphaned Fusion._N refs found:  {_scrubbedOrphanedFusionTypeRefs}");
         Console.WriteLine($"  Cross-module refs sanitized:    {_importSanitizedRefs}");
         Console.WriteLine($"  Stack-neutral replacements:     {_stackNeutralReplacements}");
         Console.WriteLine($"  Invalid method bodies fixed:    {_invalidMethodBodiesFixed}");
+        Console.WriteLine($"  Stack merge points fixed:       {_stackMergeFixes}");
+        Console.WriteLine($"  Dead branches resolved:         {_deadBranchesFixed}");
+        Console.WriteLine($"  Dead sequences cleaned:         {_deadSequencesCleaned}");
         Console.WriteLine();
         Console.WriteLine("[Deweaver] Complete!");
     }
 
     #endregion
+
+    #region Step 19: Final IL Cleanup
+
+    /// <summary>
+    /// Step 19: Comprehensive final IL cleanup pass that runs after all deweaving.
+    /// Fixes stack merge inconsistencies at branch points, resolves deterministic
+    /// branches (always-true/false from Ldnull comparisons), and aggressively
+    /// cleans dead push+pop sequences that the decompiler renders as "_ = expr;".
+    ///
+    /// These issues are caused by ReplaceInstructionWithStackNeutral creating
+    /// Pop+Ldnull sequences that produce inconsistent stack depths at branch
+    /// merge points, and by earlier cleanup steps leaving dead instruction pairs.
+    /// </summary>
+    private void Step19_FinalILCleanup()
+    {
+        Console.WriteLine("[Step 19] Final IL cleanup (stack merge, dead branches, dead sequences)...");
+        int methodsProcessed = 0;
+
+        foreach (var type in GetAllTypes())
+        {
+            if (type.Namespace == "Fusion.CodeGen") continue;
+            if (type.Name == "<PrivateImplementationDetails>") continue;
+            // CRITICAL: Never modify compiler-generated types (async state machines, iterators, lambdas).
+            // Our IL fixup passes (FixStackMergeInconsistencies, FixDeterministicBranches,
+            // EnhancedDeadCodeCleanup) insert/remove instructions that corrupt the complex
+            // control flow of compiler-generated state machines.
+            if (IsCompilerGeneratedType(type)) continue;
+
+            foreach (var method in type.Methods.Where(m => m.Body != null).ToList())
+            {
+                try
+                {
+                    // CRITICAL: Only run IL fixup on methods actually modified by the deweaver.
+                    // FixStackMergeInconsistencies inserts Pop instructions that can corrupt
+                    // non-woven methods. FixDeterministicBranches and EnhancedDeadCodeCleanup
+                    // remove instructions that may be needed by the original code's control flow.
+                    if (!WasMethodModifiedByDeweaver(method))
+                        continue;
+
+                    bool changed = true;
+                    int rounds = 0;
+                    while (changed && rounds < 5)
+                    {
+                        changed = false;
+                        rounds++;
+
+                        int fix1 = FixStackMergeInconsistencies(method);
+                        int fix2 = FixDeterministicBranches(method);
+                        int fix3 = EnhancedDeadCodeCleanup(method);
+
+                        if (fix1 + fix2 + fix3 > 0)
+                            changed = true;
+                    }
+                    if (rounds > 1) methodsProcessed++;
+                }
+                catch { }
+            }
+        }
+
+        Console.WriteLine($"  Methods with fixes applied: {methodsProcessed}");
+    }
+
+    /// <summary>
+    /// Fix stack merge inconsistencies: when multiple code paths reach the same
+    /// instruction via different branches with different stack depths, the decompiler
+    /// reports "Incompatible stack heights" errors.
+    ///
+    /// Strategy: Run full BFS stack simulation. At each instruction reachable from
+    /// multiple paths, check if all incoming stack depths are the same. If not,
+    /// insert Pop instructions on paths with excess values (these are Ldnull artifacts
+    /// from ReplaceInstructionWithStackNeutral) to bring all paths to the minimum depth.
+    /// </summary>
+    private int FixStackMergeInconsistencies(MethodDefinition method)
+    {
+        if (method.Body == null || method.Body.Instructions.Count < 3) return 0;
+
+        var instructions = method.Body.Instructions;
+        var il = method.Body.GetILProcessor();
+        int fixedCount = 0;
+
+        // Phase 1: BFS stack simulation to find all (instruction, depth) pairs
+        // Track which predecessor leads to each instruction at each depth
+        var allDepths = new Dictionary<Instruction, HashSet<int>>();
+        var predecessors = new Dictionary<Instruction, List<(Instruction pred, int arrivalDepth)>>();
+
+        var workList = new Queue<(Instruction instr, int depth, Instruction? pred)>();
+        workList.Enqueue((instructions[0], 0, null));
+
+        // Seed exception handler entry points
+        foreach (var eh in method.Body.ExceptionHandlers)
+        {
+            if (eh.HandlerType == ExceptionHandlerType.Catch || eh.HandlerType == ExceptionHandlerType.Filter)
+            {
+                if (eh.HandlerStart != null)
+                {
+                    workList.Enqueue((eh.HandlerStart, 1, null));
+                    if (!allDepths.ContainsKey(eh.HandlerStart))
+                        allDepths[eh.HandlerStart] = new HashSet<int>();
+                    allDepths[eh.HandlerStart].Add(1);
+                }
+            }
+            else if (eh.HandlerType == ExceptionHandlerType.Finally || eh.HandlerType == ExceptionHandlerType.Fault)
+            {
+                if (eh.HandlerStart != null)
+                {
+                    workList.Enqueue((eh.HandlerStart, 0, null));
+                    if (!allDepths.ContainsKey(eh.HandlerStart))
+                        allDepths[eh.HandlerStart] = new HashSet<int>();
+                    allDepths[eh.HandlerStart].Add(0);
+                }
+            }
+            if (eh.FilterStart != null)
+            {
+                workList.Enqueue((eh.FilterStart, 1, null));
+                if (!allDepths.ContainsKey(eh.FilterStart))
+                    allDepths[eh.FilterStart] = new HashSet<int>();
+                allDepths[eh.FilterStart].Add(1);
+            }
+        }
+
+        int maxIter = instructions.Count * 20;
+        while (workList.Count > 0 && maxIter-- > 0)
+        {
+            var (instr, depth, pred) = workList.Dequeue();
+
+            if (!allDepths.ContainsKey(instr))
+                allDepths[instr] = new HashSet<int>();
+
+            // Only process if we haven't seen this (instruction, depth) pair
+            if (!allDepths[instr].Add(depth)) continue;
+
+            // Record predecessor
+            if (pred != null)
+            {
+                if (!predecessors.ContainsKey(instr))
+                    predecessors[instr] = new List<(Instruction, int)>();
+                predecessors[instr].Add((pred, depth));
+            }
+
+            var (pops, pushes) = GetInstructionStackDelta(instr);
+            if (depth < pops) continue; // Underflow path, skip
+            int newDepth = depth - pops + pushes;
+
+            // Unconditional branch → only target
+            if (instr.OpCode == OpCodes.Br || instr.OpCode == OpCodes.Br_S ||
+                instr.OpCode == OpCodes.Leave || instr.OpCode == OpCodes.Leave_S)
+            {
+                if (instr.Operand is Instruction target)
+                    workList.Enqueue((target, newDepth, instr));
+                continue;
+            }
+
+            // Switch → all targets
+            if (instr.OpCode == OpCodes.Switch && instr.Operand is Instruction[] targets)
+            {
+                foreach (var target in targets)
+                    workList.Enqueue((target, newDepth, instr));
+                continue;
+            }
+
+            // Flow terminators → stop
+            if (instr.OpCode == OpCodes.Ret || instr.OpCode == OpCodes.Throw ||
+                instr.OpCode == OpCodes.Rethrow || instr.OpCode == OpCodes.Endfinally)
+                continue;
+
+            // Conditional branches → target + fall-through
+            if (instr.Operand is Instruction branchTarget)
+            {
+                bool isCond = IsConditionalBranch(instr.OpCode);
+                if (isCond)
+                    workList.Enqueue((branchTarget, newDepth, instr));
+            }
+
+            if (instr.Next != null)
+                workList.Enqueue((instr.Next, newDepth, instr));
+        }
+
+        // Phase 2: Find merge points with inconsistent depths and fix them
+        foreach (var kvp in allDepths.ToList())
+        {
+            var instr = kvp.Key;
+            var depths = kvp.Value;
+
+            if (depths.Count <= 1) continue;
+
+            int maxD = depths.Max();
+            int minD = depths.Min();
+            if (maxD == minD) continue;
+
+            // Inconsistency found! Target: bring all paths to minD by inserting Pop on paths with more
+            // We insert Pop instructions right after the branch instruction on overfull paths
+
+            if (!predecessors.TryGetValue(instr, out var preds)) continue;
+
+            foreach (var (pred, arrivalDepth) in preds.ToList())
+            {
+                if (arrivalDepth <= minD) continue; // This path is already at or below target
+
+                int diff = arrivalDepth - minD;
+                if (diff > 10) continue; // Safety: skip large imbalances (likely genuine code)
+
+                // Only insert Pop after unconditional branches (safe to modify)
+                // For conditional branches, insert before the branch target instruction
+                bool isUncond = pred.OpCode == OpCodes.Br || pred.OpCode == OpCodes.Br_S ||
+                                pred.OpCode == OpCodes.Leave || pred.OpCode == OpCodes.Leave_S;
+
+                try
+                {
+                    if (isUncond)
+                    {
+                        // Insert Pop instructions between the branch and its target
+                        for (int i = 0; i < diff; i++)
+                            il.InsertAfter(pred, il.Create(OpCodes.Pop));
+                        fixedCount++;
+                    }
+                    else
+                    {
+                        // For conditional branches: insert Pop at the start of the target block
+                        // This is safe because the Pop only affects this entry path
+                        // We need to be careful: insert before the merge instruction
+                        // But that would affect ALL paths to this instruction
+                        // Instead, we skip conditional branch paths for now - the
+                        // deterministic branch fixer should handle most of these
+                    }
+                }
+                catch { }
+            }
+        }
+
+        _stackMergeFixes += fixedCount;
+        return fixedCount;
+    }
+
+    /// <summary>
+    /// Fix deterministic branches: find patterns where a branch condition is
+    /// always true or always false due to stack-neutral replacements.
+    ///
+    /// Patterns fixed:
+    /// - Ldnull, Ldnull, Ceq → pushes 1 (true)
+    ///   - Followed by Brfalse → never jumps (replace Brfalse with Nop, dead code will be cleaned)
+    ///   - Followed by Brtrue → always jumps (replace with Br to target)
+    /// - Ldnull, Ldnull, Cgt_Un → pushes 0 (false)
+    ///   - Followed by Brfalse → always jumps
+    ///   - Followed by Brtrue → never jumps
+    /// - Ldc_I4_0, Conv_U, Ceq → pushes 1 (0 == 0 is true)
+    /// - Ldc_I4_0, Conv_U, Cgt_Un → pushes 0 (0 > 0 unsigned is false)
+    /// - Ldc_I4_0, Ldc_I4_0, Ceq → pushes 1
+    /// - Any comparison of two identical constants
+    /// </summary>
+    private int FixDeterministicBranches(MethodDefinition method)
+    {
+        if (method.Body == null || method.Body.Instructions.Count < 4) return 0;
+
+        var instructions = method.Body.Instructions;
+        var il = method.Body.GetILProcessor();
+        int fixedCount = 0;
+
+        // Build set of branch targets — don't remove these
+        var branchTargets = new HashSet<Instruction>();
+        foreach (var instr in instructions)
+        {
+            if (instr.Operand is Instruction bt) branchTargets.Add(bt);
+            else if (instr.Operand is Instruction[] bts)
+                foreach (var bt2 in bts) branchTargets.Add(bt2);
+        }
+
+        for (int i = 0; i < instructions.Count - 3; i++)
+        {
+            try
+            {
+                var i0 = instructions[i];
+                var i1 = instructions[i + 1];
+                var i2 = instructions[i + 2];
+                var i3 = instructions[i + 3];
+
+                // Pattern: Ldnull, Ldnull, Ceq/Cgt_Un, Brfalse/Brtrue
+                bool isNullNullCompare =
+                    i0.OpCode == OpCodes.Ldnull &&
+                    i1.OpCode == OpCodes.Ldnull &&
+                    (i2.OpCode == OpCodes.Ceq || i2.OpCode == OpCodes.Cgt_Un);
+
+                // Pattern: Ldc_I4_0, Conv_U, Ceq/Cgt_Un, Brfalse/Brtrue
+                bool isZeroCompare =
+                    i0.OpCode == OpCodes.Ldc_I4_0 &&
+                    i1.OpCode == OpCodes.Conv_U &&
+                    (i2.OpCode == OpCodes.Ceq || i2.OpCode == OpCodes.Cgt_Un);
+
+                // Pattern: Ldc_I4_0, Ldc_I4_0, Ceq/Cgt_Un, Brfalse/Brtrue
+                bool isZeroZeroCompare =
+                    (i0.OpCode == OpCodes.Ldc_I4_0 || i0.OpCode == OpCodes.Ldc_I4_0) &&
+                    (i1.OpCode == OpCodes.Ldc_I4_0 || i1.OpCode == OpCodes.Ldc_I4_M1) &&
+                    (i2.OpCode == OpCodes.Ceq || i2.OpCode == OpCodes.Cgt_Un);
+
+                // Pattern: Ldc_I4_X, Ldc_I4_X, Ceq (comparing same constant)
+                bool isSameConstCompare =
+                    (i0.OpCode == OpCodes.Ldc_I4 || i0.OpCode == OpCodes.Ldc_I4_S ||
+                     i0.OpCode == OpCodes.Ldc_I4_0 || i0.OpCode == OpCodes.Ldc_I4_1 ||
+                     i0.OpCode == OpCodes.Ldc_I4_2 || i0.OpCode == OpCodes.Ldc_I4_3 ||
+                     i0.OpCode == OpCodes.Ldc_I4_4 || i0.OpCode == OpCodes.Ldc_I4_5 ||
+                     i0.OpCode == OpCodes.Ldc_I4_6 || i0.OpCode == OpCodes.Ldc_I4_7 ||
+                     i0.OpCode == OpCodes.Ldc_I4_8 || i0.OpCode == OpCodes.Ldc_I4_M1) &&
+                    i0.OpCode == i1.OpCode &&
+                    i0.Operand != null && i0.Operand.Equals(i1.Operand) &&
+                    (i2.OpCode == OpCodes.Ceq || i2.OpCode == OpCodes.Cgt_Un ||
+                     i2.OpCode == OpCodes.Clt || i2.OpCode == OpCodes.Clt_Un ||
+                     i2.OpCode == OpCodes.Beq || i2.OpCode == OpCodes.Beq_S ||
+                     i2.OpCode == OpCodes.Bne_Un || i2.OpCode == OpCodes.Bne_Un_S);
+
+                bool isDeterministic = isNullNullCompare || isZeroCompare || isZeroZeroCompare || isSameConstCompare;
+                if (!isDeterministic) continue;
+
+                // Determine the comparison result
+                bool comparisonResult;
+                if (i2.OpCode == OpCodes.Ceq)
+                    comparisonResult = true; // same values are always equal
+                else if (i2.OpCode == OpCodes.Cgt_Un || i2.OpCode == OpCodes.Cgt)
+                    comparisonResult = false; // same values are never greater
+                else if (i2.OpCode == OpCodes.Clt || i2.OpCode == OpCodes.Clt_Un)
+                    comparisonResult = false; // same values are never less
+                else if (i2.OpCode == OpCodes.Beq || i2.OpCode == OpCodes.Beq_S)
+                    comparisonResult = true; // same values are always equal
+                else if (i2.OpCode == OpCodes.Bne_Un || i2.OpCode == OpCodes.Bne_Un_S)
+                    comparisonResult = false; // same values are never not-equal
+                else
+                    continue;
+
+                // Check if i2 is a comparison branch (pops 2, pushes 0, has branch target)
+                bool isComparisonBranch = (i2.OpCode == OpCodes.Beq || i2.OpCode == OpCodes.Beq_S ||
+                    i2.OpCode == OpCodes.Bne_Un || i2.OpCode == OpCodes.Bne_Un_S ||
+                    i2.OpCode == OpCodes.Bge || i2.OpCode == OpCodes.Bge_S ||
+                    i2.OpCode == OpCodes.Bgt || i2.OpCode == OpCodes.Bgt_S ||
+                    i2.OpCode == OpCodes.Ble || i2.OpCode == OpCodes.Ble_S ||
+                    i2.OpCode == OpCodes.Blt || i2.OpCode == OpCodes.Blt_S);
+
+                if (isComparisonBranch)
+                {
+                    // i2 is both comparison AND branch
+                    // comparisonResult=true → always take branch, comparisonResult=false → never take
+                    Instruction? target = i2.Operand as Instruction;
+
+                    // Replace i0, i1, i2 with Nop, Nop, Br/Nop
+                    il.Replace(i0, il.Create(OpCodes.Nop));
+                    il.Replace(i1, il.Create(OpCodes.Nop));
+
+                    if (comparisonResult && target != null)
+                    {
+                        // Always take the branch
+                        il.Replace(i2, il.Create(OpCodes.Br, target));
+                    }
+                    else
+                    {
+                        // Never take the branch
+                        il.Replace(i2, il.Create(OpCodes.Nop));
+                    }
+                    fixedCount++;
+                    i += 2; // Skip ahead
+                    continue;
+                }
+
+                // i2 is Ceq/Cgt_Un (comparison, not branch), i3 is Brfalse/Brtrue
+                bool isCondBranch = i3.OpCode == OpCodes.Brfalse || i3.OpCode == OpCodes.Brfalse_S ||
+                                    i3.OpCode == OpCodes.Brtrue || i3.OpCode == OpCodes.Brtrue_S;
+                if (!isCondBranch) continue;
+
+                Instruction? branchTarget = i3.Operand as Instruction;
+
+                // Replace i0, i1, i2 with Nop, Nop, Nop
+                il.Replace(i0, il.Create(OpCodes.Nop));
+                il.Replace(i1, il.Create(OpCodes.Nop));
+                il.Replace(i2, il.Create(OpCodes.Nop));
+
+                if (i3.OpCode == OpCodes.Brfalse || i3.OpCode == OpCodes.Brfalse_S)
+                {
+                    // Brfalse: jumps when condition is false/0
+                    // If comparisonResult=true → condition is 1 → Brfalse doesn't jump → fall through
+                    // If comparisonResult=false → condition is 0 → Brfalse jumps
+                    if (!comparisonResult && branchTarget != null)
+                    {
+                        // Always jump
+                        il.Replace(i3, il.Create(OpCodes.Br, branchTarget));
+                    }
+                    else
+                    {
+                        // Never jump
+                        il.Replace(i3, il.Create(OpCodes.Nop));
+                    }
+                }
+                else // Brtrue
+                {
+                    // Brtrue: jumps when condition is true/1
+                    if (comparisonResult && branchTarget != null)
+                    {
+                        // Always jump
+                        il.Replace(i3, il.Create(OpCodes.Br, branchTarget));
+                    }
+                    else
+                    {
+                        // Never jump
+                        il.Replace(i3, il.Create(OpCodes.Nop));
+                    }
+                }
+
+                fixedCount++;
+                i += 3;
+            }
+            catch { }
+        }
+
+        _deadBranchesFixed += fixedCount;
+        return fixedCount;
+    }
+
+    /// <summary>
+    /// Enhanced dead code cleanup: more aggressively removes dead push+pop patterns
+    /// that the decompiler renders as "_ = expr;" (discarded expression statements).
+    ///
+    /// Beyond what AggressiveStackCleanup does, this also handles:
+    /// - Call/Callvirt (pure getter) + Pop → remove both
+    /// - Ldftn + Newobj Delegate + Pop → remove all 3
+    /// - Ldfld + Stloc (store to unused local) + Pop of load → remove the chain
+    /// - Newobj + Pop (discarded object creation) → remove both
+    /// - Conv_I4/Ldind + Pop → remove both
+    /// - Castclass/Isinst + Pop → remove both
+    /// </summary>
+    private int EnhancedDeadCodeCleanup(MethodDefinition method)
+    {
+        if (method.Body == null || method.Body.Instructions.Count < 2) return 0;
+
+        var instructions = method.Body.Instructions;
+        var il = method.Body.GetILProcessor();
+        int cleaned = 0;
+        bool changed = true;
+        int maxRounds = 5;
+
+        while (changed && maxRounds-- > 0)
+        {
+            changed = false;
+
+            // Build branch target set
+            var branchTargets = new HashSet<Instruction>();
+            foreach (var instr in instructions)
+            {
+                if (instr.Operand is Instruction bt) branchTargets.Add(bt);
+                else if (instr.Operand is Instruction[] bts)
+                    foreach (var bt2 in bts) branchTargets.Add(bt2);
+            }
+
+            // Pass 1: Remove pure push + Pop pairs (expanded set)
+            for (int i = 0; i < instructions.Count - 1; i++)
+            {
+                var push = instructions[i];
+                var pop = instructions[i + 1];
+
+                if (pop.OpCode != OpCodes.Pop) continue;
+                if (branchTargets.Contains(push) || branchTargets.Contains(pop)) continue;
+
+                var (pops, pushes) = GetInstructionStackDelta(push);
+
+                // Remove any instruction that pushes exactly 1 value and pops 0 (pure push)
+                // EXCEPT calls (may have side effects) and Dup (needed for stack balance)
+                if (pushes == 1 && pops == 0 &&
+                    push.OpCode != OpCodes.Call && push.OpCode != OpCodes.Callvirt &&
+                    push.OpCode != OpCodes.Newobj && push.OpCode != OpCodes.Ldftn &&
+                    push.OpCode != OpCodes.Ldvirtftn && push.OpCode != OpCodes.Dup &&
+                    push.OpCode != OpCodes.Ldloca && push.OpCode != OpCodes.Ldloca_S &&
+                    push.OpCode != OpCodes.Ldflda && push.OpCode != OpCodes.Ldsflda &&
+                    push.OpCode != OpCodes.Ldarga && push.OpCode != OpCodes.Ldarga_S)
+                {
+                    try
+                    {
+                        il.Remove(pop);
+                        il.Remove(push);
+                        cleaned++;
+                        changed = true;
+                        break; // Restart scan after modification
+                    }
+                    catch { }
+                }
+
+                // Remove conversion + Pop (Conv_I4, Conv_R4, Castclass, Isinst, Box, Unbox_Any + Pop)
+                if ((push.OpCode == OpCodes.Conv_I1 || push.OpCode == OpCodes.Conv_I2 ||
+                     push.OpCode == OpCodes.Conv_I4 || push.OpCode == OpCodes.Conv_I8 ||
+                     push.OpCode == OpCodes.Conv_U1 || push.OpCode == OpCodes.Conv_U2 ||
+                     push.OpCode == OpCodes.Conv_U4 || push.OpCode == OpCodes.Conv_U8 ||
+                     push.OpCode == OpCodes.Conv_U || push.OpCode == OpCodes.Conv_R4 ||
+                     push.OpCode == OpCodes.Conv_R8 || push.OpCode == OpCodes.Conv_Ovf_I ||
+                     push.OpCode == OpCodes.Conv_Ovf_I4 || push.OpCode == OpCodes.Conv_Ovf_I8 ||
+                     push.OpCode == OpCodes.Conv_Ovf_U || push.OpCode == OpCodes.Conv_Ovf_U4 ||
+                     push.OpCode == OpCodes.Castclass || push.OpCode == OpCodes.Isinst ||
+                     push.OpCode == OpCodes.Box || push.OpCode == OpCodes.Unbox ||
+                     push.OpCode == OpCodes.Unbox_Any ||
+                     push.OpCode == OpCodes.Ldind_I || push.OpCode == OpCodes.Ldind_I1 ||
+                     push.OpCode == OpCodes.Ldind_I2 || push.OpCode == OpCodes.Ldind_I4 ||
+                     push.OpCode == OpCodes.Ldind_I8 || push.OpCode == OpCodes.Ldind_R4 ||
+                     push.OpCode == OpCodes.Ldind_R8 || push.OpCode == OpCodes.Ldind_Ref ||
+                     push.OpCode == OpCodes.Ldind_U1 || push.OpCode == OpCodes.Ldind_U2 ||
+                     push.OpCode == OpCodes.Ldind_U4 || push.OpCode == OpCodes.Ldobj ||
+                     push.OpCode == OpCodes.Ldlen || push.OpCode == OpCodes.Ldtoken) &&
+                    !branchTargets.Contains(push))
+                {
+                    // This is a load/convert instruction followed by Pop — the result is discarded
+                    // But we also need to remove whatever PUSHED the value that this instruction consumes
+                    // Look back for the value push (skip branch targets)
+                    // Path A: try to remove prev (pure push) + push (conversion) + Pop as a group
+                    bool pathAAttempted = false;
+                    bool pathAFullySucceeded = false;
+                    if (i > 0)
+                    {
+                        var prev = instructions[i - 1];
+                        var (prevPops, prevPushes) = GetInstructionStackDelta(prev);
+                        pathAAttempted = prevPushes == 1 && prevPops == 0 && !branchTargets.Contains(prev);
+                        if (pathAAttempted)
+                        {
+                            try
+                            {
+                                il.Remove(pop);
+                                il.Remove(push);
+                                il.Remove(prev);
+                                pathAFullySucceeded = true;
+                                cleaned++;
+                                changed = true;
+                                break;
+                            }
+                            catch { }
+                        }
+                    }
+                    // Path B: fallback — replace conversion with Pop.
+                    // Only runs if Path A was not attempted, or if it was attempted but
+                    // threw (partial removal may have left the list inconsistent).
+                    if (!pathAFullySucceeded)
+                    {
+                        try
+                        {
+                            il.Remove(pop);
+                            il.Replace(push, il.Create(OpCodes.Pop));
+                            cleaned++;
+                            changed = true;
+                            break;
+                        }
+                        catch { }
+                    }
+                }
+
+                // Remove Newobj + Pop (discarded object creation)
+                // Only safe when the constructor takes zero parameters — otherwise the argument
+                // push instructions are stranded on the stack with no consumer, corrupting
+                // stack height for every subsequent instruction.
+                if ((push.OpCode == OpCodes.Newobj) &&
+                    push.Operand is MethodReference ctorRef && ctorRef.Parameters.Count == 0 &&
+                    !branchTargets.Contains(push))
+                {
+                    try
+                    {
+                        il.Remove(pop);
+                        il.Remove(push);
+                        cleaned++;
+                        changed = true;
+                        break;
+                    }
+                    catch { }
+                }
+            }
+
+            // Pass 2: Remove 3-instruction dead sequences: Ldftn, Newobj Delegate, Pop
+            for (int i = 0; i < instructions.Count - 2; i++)
+            {
+                var i0 = instructions[i];
+                var i1 = instructions[i + 1];
+                var i2 = instructions[i + 2];
+
+                if (i2.OpCode != OpCodes.Pop) continue;
+                if (branchTargets.Contains(i0) || branchTargets.Contains(i1) || branchTargets.Contains(i2)) continue;
+
+                // Pattern: Ldftn + Newobj (Delegate ctor) + Pop
+                if ((i0.OpCode == OpCodes.Ldftn || i0.OpCode == OpCodes.Ldvirtftn) &&
+                    i1.OpCode == OpCodes.Newobj)
+                {
+                    try
+                    {
+                        il.Remove(i2);
+                        il.Remove(i1);
+                        il.Remove(i0);
+                        cleaned++;
+                        changed = true;
+                        break;
+                    }
+                    catch { }
+                }
+
+                // Pattern: Callvirt (pure getter, returns value) + Stloc (unused) + Pop
+                // This is a store-to-local-then-immediately-discard pattern (value never read)
+                if (i0.OpCode == OpCodes.Callvirt && i0.Operand is MethodReference mr0 &&
+                    mr0.ReturnType.MetadataType != MetadataType.Void &&
+                    (i1.OpCode == OpCodes.Stloc || i1.OpCode == OpCodes.Stloc_S ||
+                     i1.OpCode == OpCodes.Stloc_0 || i1.OpCode == OpCodes.Stloc_1 ||
+                     i1.OpCode == OpCodes.Stloc_2 || i1.OpCode == OpCodes.Stloc_3) &&
+                    i2.OpCode == OpCodes.Pop)
+                {
+                    // Check if the local is never read again
+                    // Macro Stloc opcodes (Stloc_0/1/2/3) have Operand == null in Cecil,
+                    // so resolve the variable from the body's variable list by index.
+                    var localVar = ResolveLocVariable(i1, method.Body);
+                    if (localVar != null)
+                    {
+                        bool isLocalUsedAfter = false;
+                        for (int j = i + 2; j < instructions.Count; j++)
+                        {
+                            // Macro Ldloc opcodes also have null Operand — resolve for comparison
+                            var scanVar = ResolveLocVariable(instructions[j], method.Body);
+                            if (scanVar != null &&
+                                (instructions[j].OpCode == OpCodes.Ldloc ||
+                                 instructions[j].OpCode == OpCodes.Ldloc_S ||
+                                 instructions[j].OpCode == OpCodes.Ldloc_0 ||
+                                 instructions[j].OpCode == OpCodes.Ldloc_1 ||
+                                 instructions[j].OpCode == OpCodes.Ldloc_2 ||
+                                 instructions[j].OpCode == OpCodes.Ldloc_3 ||
+                                 instructions[j].OpCode == OpCodes.Ldloca ||
+                                 instructions[j].OpCode == OpCodes.Ldloca_S) &&
+                                scanVar == localVar)
+                            {
+                                isLocalUsedAfter = true;
+                                break;
+                            }
+                        }
+                        if (!isLocalUsedAfter)
+                        {
+                            try
+                            {
+                                il.Remove(i2); // Pop
+                                il.Remove(i1); // Stloc
+                                il.Remove(i0); // Callvirt
+                                cleaned++;
+                                changed = true;
+                                break;
+                            }
+                            catch { }
+                        }
+                    }
+                }
+            }
+
+            // Pass 3: Remove Nop-heavy sequences (more than 3 consecutive Nops → reduce to 1)
+            int nopRunStart = -1;
+            for (int i = 0; i < instructions.Count; i++)
+            {
+                if (instructions[i].OpCode == OpCodes.Nop)
+                {
+                    if (nopRunStart < 0) nopRunStart = i;
+                }
+                else
+                {
+                    if (nopRunStart >= 0 && i - nopRunStart > 3)
+                    {
+                        // Remove excess Nops (keep the first one as a branch target placeholder)
+                        try
+                        {
+                            for (int j = i - 1; j > nopRunStart; j--)
+                            {
+                                if (instructions[j].OpCode == OpCodes.Nop && !branchTargets.Contains(instructions[j]))
+                                {
+                                    il.Remove(instructions[j]);
+                                    cleaned++;
+                                    changed = true;
+                                }
+                            }
+                            break;
+                        }
+                        catch { }
+                    }
+                    nopRunStart = -1;
+                }
+            }
+        }
+
+        _deadSequencesCleaned += cleaned;
+        return cleaned;
+    }
+
+    /// <summary>
+    /// Check if an opcode is a conditional branch instruction.
+    /// </summary>
+    private static bool IsConditionalBranch(OpCode op)
+    {
+        return op == OpCodes.Brtrue || op == OpCodes.Brtrue_S ||
+               op == OpCodes.Brfalse || op == OpCodes.Brfalse_S ||
+               op == OpCodes.Beq || op == OpCodes.Beq_S ||
+               op == OpCodes.Bne_Un || op == OpCodes.Bne_Un_S ||
+               op == OpCodes.Bge || op == OpCodes.Bge_S ||
+               op == OpCodes.Bge_Un || op == OpCodes.Bge_Un_S ||
+               op == OpCodes.Bgt || op == OpCodes.Bgt_S ||
+               op == OpCodes.Bgt_Un || op == OpCodes.Bgt_Un_S ||
+               op == OpCodes.Ble || op == OpCodes.Ble_S ||
+               op == OpCodes.Ble_Un || op == OpCodes.Ble_Un_S ||
+               op == OpCodes.Blt || op == OpCodes.Blt_S ||
+               op == OpCodes.Blt_Un || op == OpCodes.Blt_Un_S;
+    }
+
+    #endregion
+    private void Step20_SanitizeUnsafePointerConversions()
+    {
+        int fixes = 0;
+        foreach (var type in _module.Types)
+        {
+            foreach (var method in type.Methods)
+            {
+                if (!method.HasBody) continue;
+
+                var il = method.Body.GetILProcessor();
+                var instructions = method.Body.Instructions;
+
+                for (int i = 0; i < instructions.Count; i++)
+                {
+                    var instr = instructions[i];
+
+                    // Pattern: char -> conv.u
+                    // This causes CS0030: Cannot convert type 'char' to 'ushort*'
+                    if (instr.OpCode == OpCodes.Conv_U && i > 0)
+                    {
+                        var prev = instructions[i - 1];
+                        
+                        // Check if the value on stack is a char
+                        // We can't always know for sure without full stack analysis, 
+                        // but we can check if the previous instruction is a load of a char argument/local.
+                        bool isChar = false;
+                        if (prev.OpCode == OpCodes.Ldarg_1 || prev.OpCode == OpCodes.Ldarg_2 || prev.OpCode == OpCodes.Ldarg_3 || prev.OpCode == OpCodes.Ldarg_S) isChar = true; // Heuristic
+                        
+                        if (isChar)
+                        {
+                            // Insert conv.i4 before conv.u to allow (ushort*)(int)char cast
+                            il.InsertBefore(instr, il.Create(OpCodes.Conv_I4));
+                            fixes++;
+                            i++; // Skip newly inserted instruction
+                        }
+                    }
+                }
+            }
+        }
+        Console.WriteLine($"  Unsafe pointer conversions sanitized: {fixes}");
+    }
 }
 
 /// <summary>
@@ -7110,10 +8492,16 @@ class TolerantAssemblyResolver : IAssemblyResolver
 {
     private readonly DefaultAssemblyResolver _inner;
     private readonly Dictionary<string, AssemblyDefinition> _stubs = new();
+    private readonly HashSet<AssemblyDefinition> _resolvedAssemblies = new();
 
     public TolerantAssemblyResolver(DefaultAssemblyResolver inner)
     {
         _inner = inner;
+    }
+
+    public IEnumerable<AssemblyDefinition> GetResolvedAssemblies()
+    {
+        return _resolvedAssemblies.Concat(_stubs.Values).Distinct();
     }
 
     /// <summary>
@@ -7145,7 +8533,9 @@ class TolerantAssemblyResolver : IAssemblyResolver
     {
         try
         {
-            return _inner.Resolve(name);
+            var asm = _inner.Resolve(name);
+            if (asm != null) _resolvedAssemblies.Add(asm);
+            return asm;
         }
         catch
         {
@@ -7158,7 +8548,9 @@ class TolerantAssemblyResolver : IAssemblyResolver
     {
         try
         {
-            return _inner.Resolve(name, parameters);
+            var asm = _inner.Resolve(name, parameters);
+            if (asm != null) _resolvedAssemblies.Add(asm);
+            return asm;
         }
         catch
         {
